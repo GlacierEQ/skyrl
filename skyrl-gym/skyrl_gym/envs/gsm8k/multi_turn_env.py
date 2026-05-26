@@ -1,5 +1,4 @@
 from typing import Dict, Any
-from omegaconf import DictConfig
 
 from skyrl_gym.envs.base_text_env import BaseTextEnv, BaseTextEnvStepOutput
 from skyrl_gym.envs.gsm8k import utils
@@ -10,7 +9,7 @@ class GSM8kMultiTurnEnv(BaseTextEnv):
     Multi-turn GSM8k environment with turn-level rewards.
     """
 
-    def __init__(self, env_config: DictConfig, extras: Dict[str, Any] = {}):
+    def __init__(self, env_config: Any = None, extras: Dict[str, Any] = {}):
         super().__init__()
         reward_spec = extras.get("reward_spec", {})
         assert "ground_truth" in reward_spec, "reward_spec.ground_truth is required"
@@ -59,13 +58,22 @@ class GSM8kMultiTurnEnv(BaseTextEnv):
 
         observations = [] if done else self._make_observation()
 
-        metadata = {
-            "turns": self.turns,
-        }
-
         return BaseTextEnvStepOutput(
             observations=observations,
             reward=reward,
             done=done,
-            metadata=metadata,
+            metadata={},
         )
+
+    def get_metrics(self) -> Dict[str, Any]:
+        return {
+            "steps": self.turns,
+        }
+
+    @staticmethod
+    def aggregate_metrics(metrics: list[Dict[str, Any]]) -> Dict[str, Any]:
+        if not metrics:
+            return {}
+        n = len(metrics)
+        avg_steps = sum(float(m.get("steps", 0)) for m in metrics) / n
+        return {"avg_steps": avg_steps}
