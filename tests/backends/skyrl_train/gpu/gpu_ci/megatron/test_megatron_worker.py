@@ -12,18 +12,22 @@ from skyrl.backends.skyrl_train.distributed.dispatch import (
     WorkerOutput,
     loss_fn_outputs_to_tensor,
 )
-from skyrl.backends.skyrl_train.inference_engines.utils import (
+from skyrl.backends.skyrl_train.inference_servers.engine_utils import (
     get_sampling_params_for_backend,
 )
 from skyrl.backends.skyrl_train.training_batch import TrainingInputBatch
+from skyrl.backends.skyrl_train.utils.ppo_utils import PolicyLossType
 from skyrl.backends.skyrl_train.utils.torch_utils import logprobs_from_logits
-from skyrl.env_vars import _SKYRL_USE_NEW_INFERENCE
 from skyrl.train.config import (
-    MegatronTorchProfilerConfig,
     SkyRLLoraConfig,
     SkyRLTrainConfig,
+    TorchProfilerConfig,
 )
-from skyrl.train.utils.utils import print_mem, validate_cfg
+from skyrl.train.fused_lm_head import FusedLmHeadBackend
+from skyrl.train.utils.utils import (
+    print_mem,
+    validate_cfg,
+)
 from tests.backends.skyrl_train.gpu.utils import (
     InferenceEngineState,
     Timer,
@@ -46,7 +50,7 @@ def get_test_actor_config(model_name=MODEL_NAME) -> SkyRLTrainConfig:
     cfg.trainer.policy.model.path = model_name
     cfg.trainer.micro_forward_batch_size_per_gpu = 2
     cfg.trainer.micro_train_batch_size_per_gpu = 2
-    cfg.trainer.use_sample_packing = False
+    cfg.trainer.remove_microbatch_padding = False
     cfg.trainer.logger = "console"
     if "moonlight" in model_name:
         if cfg.trainer.policy.megatron_config.transformer_config_kwargs is None:
@@ -118,17 +122,49 @@ def get_test_training_batch(batch_size=4) -> TrainingInputBatch:
 
 
 @pytest.mark.parametrize(
-    ("colocate_all", "inference_tp", "megatron_tp", "megatron_pp", "megatron_ep", "megatron_etp", "lora"),
+    (
+        "weight_sync_backend",
+        "colocate_all",
+        "inference_tp",
+        "megatron_tp",
+        "megatron_pp",
+        "megatron_ep",
+        "megatron_etp",
+        "lora",
+        "num_engines",
+    ),
     [
-        pytest.param(True, 4, 2, 2, 1, None, False, id="colocate_all"),
-        pytest.param(False, 2, 2, 1, 1, None, False, id="non_colocated"),
-        pytest.param(True, 4, 2, 2, 1, None, True, id="colocate_all_lora"),
+        pytest.param("nccl", True, 4, 2, 2, 1, None, False, 1, id="nccl_colocate_all"),
+        pytest.param("nccl", False, 2, 2, 1, 1, None, False, 1, id="nccl_non_colocated"),
+        pytest.param("nccl", True, 4, 2, 2, 1, None, True, 1, id="nccl_colocate_all_lora"),
+        # sharded_rdt (NIXL pull): non-colocated only. Both variants fit 4 GPUs --
+        # policy world = megatron_tp*megatron_pp, engines = inference_tp*num_engines.
+        #
+        #   TP2/TP2:  2 policy + 1 engine x TP2  = 4. Trainer TP gather feeding an
+        #             inference-TP-sharded consumer plan. The model is dense and
+        #             pp == 1, so this covers the plain whole-model weight source.
+        #   TP1/PP2:  2 policy + 2 engines x TP1 = 4. Covers trainer PP>1, so the
+        #             stacked source's PP-local serving engages (each stage declares
+        #             only its own layers via held_names), AND num_engines>1, so the
+        #             consumer ids are offset per deployment by replica_rank -- the
+        #             M:N path that deadlocked before that fix.
+        pytest.param("sharded_rdt", False, 2, 2, 1, 1, None, False, 1, id="sharded_rdt_infer_tp2_trainer_tp2"),
+        pytest.param("sharded_rdt", False, 1, 1, 2, 1, None, False, 2, id="sharded_rdt_infer_tp1_trainer_pp2_2engines"),
     ],
 )
 @pytest.mark.asyncio
 @pytest.mark.megatron
 async def test_megatron_policy_weight_sync(
-    ray_init_fixture, colocate_all, inference_tp, megatron_tp, megatron_pp, megatron_ep, megatron_etp, lora
+    ray_init_fixture,
+    weight_sync_backend,
+    colocate_all,
+    inference_tp,
+    megatron_tp,
+    megatron_pp,
+    megatron_ep,
+    megatron_etp,
+    lora,
+    num_engines,
 ):
     """
     Test that we can sync weights between policy and inference for megatron then run inference
@@ -138,7 +174,7 @@ async def test_megatron_policy_weight_sync(
         if lora:
             cfg.trainer.policy.model.lora = SkyRLLoraConfig(rank=16, alpha=16)
         cfg.trainer.placement.colocate_all = colocate_all
-        cfg.generator.inference_engine.weight_sync_backend = "nccl"
+        cfg.generator.inference_engine.weight_sync_backend = weight_sync_backend
         cfg.trainer.strategy = "megatron"
         cfg.generator.inference_engine.backend = "vllm"
         cfg.generator.inference_engine.tensor_parallel_size = inference_tp
@@ -155,6 +191,7 @@ async def test_megatron_policy_weight_sync(
             model=MODEL_NAME,
             use_local=True,
             backend="vllm",
+            num_inference_engines=num_engines,
             sleep_level=2,  # since we explicitly sync weights
         ) as engines:
             client, pg = engines.client, engines.pg
@@ -164,7 +201,9 @@ async def test_megatron_policy_weight_sync(
                 "policy",
                 shared_pg=pg,
                 colocate_all=cfg.trainer.placement.colocate_all,
-                num_gpus_per_node=cfg.generator.inference_engine.tensor_parallel_size,
+                # The policy world is what the megatron geometry needs, which is not
+                # necessarily inference_tp (e.g. inference TP1 + trainer PP2).
+                num_gpus_per_node=megatron_tp * megatron_pp,
                 cfg=cfg,
             )
             ray.get(
@@ -189,9 +228,7 @@ async def test_megatron_policy_weight_sync(
             sampling_params = get_sampling_params_for_backend(
                 cfg.generator.inference_engine.backend, cfg.generator.sampling_params
             )
-            tokenizer = (
-                AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True) if _SKYRL_USE_NEW_INFERENCE else None
-            )
+            tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
             outputs = await run_inference(client, get_test_prompts(MODEL_NAME), sampling_params, tokenizer=tokenizer)
 
             print(f"Example output: {outputs['responses'][0]}, {outputs['stop_reasons'][0]}")
@@ -201,17 +238,29 @@ async def test_megatron_policy_weight_sync(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("worker_type", "tp", "pp", "cp", "ep", "etp", "gpus_per_node", "use_sample_packing", "lora"),
+    (
+        "worker_type",
+        "tp",
+        "pp",
+        "cp",
+        "ep",
+        "etp",
+        "gpus_per_node",
+        "remove_microbatch_padding",
+        "lora",
+        "cp_comm_type",
+    ),
     [
-        ("policy", 2, 1, 1, 1, None, 2, False, False),
+        ("policy", 2, 1, 1, 1, None, 2, False, False, None),
         # ref has same forward pass as policy - just duplicate one test to test setup
-        ("ref", 2, 1, 1, 1, None, 2, False, False),
-        ("policy", 2, 2, 1, 1, None, 4, False, False),
-        ("policy", 2, 2, 1, 1, None, 4, True, False),
-        ("policy", 2, 2, 1, 1, None, 4, True, True),
-        ("policy", 1, 1, 2, 1, None, 2, True, False),
-        ("policy", 2, 1, 2, 1, None, 4, True, False),
-        ("policy", 4, 1, 1, 4, 1, 4, True, False),
+        ("ref", 2, 1, 1, 1, None, 2, False, False, None),
+        ("policy", 2, 2, 1, 1, None, 4, False, False, None),
+        ("policy", 2, 2, 1, 1, None, 4, True, False, None),
+        ("policy", 2, 2, 1, 1, None, 4, True, True, None),
+        ("policy", 1, 1, 2, 1, None, 2, True, False, None),
+        ("policy", 1, 1, 2, 1, None, 2, True, False, "a2a"),
+        ("policy", 2, 1, 2, 1, None, 4, True, False, None),
+        ("policy", 4, 1, 1, 4, 1, 4, True, False, None),
     ],
     ids=[
         "tp2_pp1_policy",
@@ -220,13 +269,24 @@ async def test_megatron_policy_weight_sync(
         "tp2_pp2_policy_seq_packing",
         "tp2_pp2_lora",
         "cp_2_policy_seq_packing",
+        "cp_2_policy_seq_packing_a2a",
         "tp_2_cp_2_policy_seq_packing",
         "tp4_pp1_cp1_ep4_etp1_policy_seq_packing",
     ],
 )
 @pytest.mark.megatron
 async def test_megatron_forward(
-    ray_init_fixture, worker_type, tp, pp, cp, ep, etp, gpus_per_node, use_sample_packing, lora
+    ray_init_fixture,
+    worker_type,
+    tp,
+    pp,
+    cp,
+    ep,
+    etp,
+    gpus_per_node,
+    remove_microbatch_padding,
+    lora,
+    cp_comm_type,
 ):
     """
     Test that the Megatron forward pass is numerically equivalent to just running a huggingface model forward.
@@ -240,8 +300,11 @@ async def test_megatron_forward(
     cfg.trainer.policy.megatron_config.context_parallel_size = cp
     cfg.trainer.policy.megatron_config.expert_model_parallel_size = ep
     cfg.trainer.policy.megatron_config.expert_tensor_parallel_size = etp
-    cfg.trainer.use_sample_packing = use_sample_packing
+    cfg.trainer.remove_microbatch_padding = remove_microbatch_padding
     batch = get_test_training_batch(max(4, gpus_per_node))
+
+    if cp_comm_type is not None:
+        cfg.trainer.policy.megatron_config.transformer_config_kwargs["cp_comm_type"] = cp_comm_type
 
     if ep > 1:
         if cfg.trainer.policy.megatron_config.transformer_config_kwargs is None:
@@ -364,7 +427,7 @@ async def test_megatron_lora_forward(ray_init_fixture, tp, pp, cp, ep, etp, gpus
     cfg.trainer.policy.megatron_config.context_parallel_size = cp
     cfg.trainer.policy.megatron_config.expert_model_parallel_size = ep
     cfg.trainer.policy.megatron_config.expert_tensor_parallel_size = etp
-    cfg.trainer.use_sample_packing = True
+    cfg.trainer.remove_microbatch_padding = True
     batch = get_test_training_batch(max(4, gpus_per_node))
 
     if ep > 1:
@@ -396,7 +459,7 @@ async def test_megatron_lora_forward(ray_init_fixture, tp, pp, cp, ep, etp, gpus
     cfg.trainer.policy.megatron_config.context_parallel_size = cp
     cfg.trainer.policy.megatron_config.expert_model_parallel_size = ep
     cfg.trainer.policy.megatron_config.expert_tensor_parallel_size = etp
-    cfg.trainer.use_sample_packing = True
+    cfg.trainer.remove_microbatch_padding = True
     batch = get_test_training_batch(max(4, gpus_per_node))
 
     # set lora this time
@@ -435,15 +498,33 @@ async def test_megatron_lora_forward(ray_init_fixture, tp, pp, cp, ep, etp, gpus
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("worker_type", "tp", "pp", "cp", "ep", "etp", "gpus_per_node", "use_sample_packing", "use_entropy_loss", "lora"),
+    (
+        "worker_type",
+        "tp",
+        "pp",
+        "cp",
+        "ep",
+        "etp",
+        "gpus_per_node",
+        "remove_microbatch_padding",
+        "use_entropy_loss",
+        "fused_lm_head_backend",
+        "lora",
+        "cp_comm_type",
+    ),
     [
-        ("policy", 2, 2, 1, 1, 1, 4, True, False, False),
-        ("policy", 2, 2, 1, 1, 1, 4, True, True, False),
-        ("policy", 2, 2, 1, 1, 1, 4, True, False, True),
-        ("policy", 2, 2, 1, 1, 1, 4, False, False, False),
-        ("policy", 2, 1, 2, 1, 1, 4, True, False, False),
-        ("policy", 4, 1, 1, 4, 1, 4, True, False, False),
-        ("policy", 4, 1, 1, 4, 1, 4, True, False, True),
+        ("policy", 2, 2, 1, 1, 1, 4, True, False, None, False, None),
+        ("policy", 2, 2, 1, 1, 1, 4, True, True, None, False, None),
+        ("policy", 2, 2, 1, 1, 1, 4, True, False, None, True, None),
+        ("policy", 2, 2, 1, 1, 1, 4, False, False, None, False, None),
+        ("policy", 2, 1, 2, 1, 1, 4, True, False, None, False, None),
+        ("policy", 2, 1, 2, 1, 1, 4, True, True, None, False, None),
+        ("policy", 2, 1, 2, 1, 1, 4, True, True, "torch", False, None),
+        ("policy", 2, 1, 2, 1, 1, 4, True, True, "triton", False, None),
+        ("policy", 2, 1, 2, 1, 1, 4, True, True, FusedLmHeadBackend.TRITON_BLOCK_SPARSE, False, None),
+        ("policy", 2, 1, 2, 1, 1, 4, True, False, None, False, "a2a"),
+        ("policy", 4, 1, 1, 4, 1, 4, True, False, None, False, None),
+        ("policy", 4, 1, 1, 4, 1, 4, True, False, None, True, None),
     ],
     ids=[
         "tp2_pp2_policy_seq_packing",
@@ -451,13 +532,30 @@ async def test_megatron_lora_forward(ray_init_fixture, tp, pp, cp, ep, etp, gpus
         "tp2_pp2_policy_lora",
         "tp2_pp2_policy_unpacked",
         "tp2_cp2_policy_seq_packing_no_entropy_loss",
+        "tp2_cp2_policy_seq_packing_with_entropy_loss",
+        "tp2_cp2_policy_seq_packing_fused_torch_entropy_loss",
+        "tp2_cp2_policy_seq_packing_fused_triton_entropy_loss",
+        "tp2_cp2_policy_seq_packing_fused_triton_block_sparse_entropy_loss",
+        "tp2_cp2_policy_seq_packing_no_entropy_loss_a2a",
         "tp4_pp1_cp1_ep4_etp1_policy_seq_packing",
         "tp4_pp1_cp1_ep4_etp1_policy_seq_packing_lora",
     ],
 )
 @pytest.mark.megatron
 async def test_megatron_train(
-    ray_init_fixture, worker_type, tp, pp, cp, ep, etp, gpus_per_node, use_sample_packing, use_entropy_loss, lora
+    ray_init_fixture,
+    worker_type,
+    tp,
+    pp,
+    cp,
+    ep,
+    etp,
+    gpus_per_node,
+    remove_microbatch_padding,
+    use_entropy_loss,
+    fused_lm_head_backend,
+    lora,
+    cp_comm_type,
 ):
     """
     Full test: initialize actor group, send dummy experience to training_step, validate output.
@@ -473,11 +571,19 @@ async def test_megatron_train(
     cfg.trainer.policy.megatron_config.context_parallel_size = cp
     cfg.trainer.policy.megatron_config.expert_model_parallel_size = ep
     cfg.trainer.policy.megatron_config.expert_tensor_parallel_size = etp
-    cfg.trainer.use_sample_packing = use_sample_packing
+    cfg.trainer.remove_microbatch_padding = remove_microbatch_padding
     cfg.trainer.algorithm.use_kl_loss = False
+    if cp_comm_type is not None:
+        cfg.trainer.policy.megatron_config.transformer_config_kwargs["cp_comm_type"] = cp_comm_type
     if use_entropy_loss:
         cfg.trainer.algorithm.use_entropy_loss = True
         cfg.trainer.algorithm.entropy_loss_coef = 0.01
+    if fused_lm_head_backend is not None:
+        cfg.trainer.fused_lm_head_logprob = True
+        cfg.trainer.fused_lm_head_logprob_backend = fused_lm_head_backend
+        if fused_lm_head_backend == FusedLmHeadBackend.TRITON_BLOCK_SPARSE:
+            cfg.trainer.algorithm.policy_loss_type = PolicyLossType.ROLLOUT_IS
+            batch["action_log_probs"] = None
     if lora:
         cfg.trainer.policy.model.lora = SkyRLLoraConfig(rank=16, alpha=16)
 
@@ -490,6 +596,10 @@ async def test_megatron_train(
         cfg.trainer.algorithm.off_policy_correction.sequence_mask_metric = "geometric"
         cfg.trainer.algorithm.off_policy_correction.geo_mask_high = 1.02
         cfg.trainer.algorithm.off_policy_correction.geo_mask_low = 0.98
+
+        cfg.trainer.policy.megatron_config.moe_router_load_balancing_type = "seq_aux_loss"
+        cfg.trainer.policy.megatron_config.moe_aux_loss_coeff = 0.000001
+        cfg.trainer.policy.megatron_config.moe_per_layer_logging = True
 
     # set batch sizes correctly
     cfg.trainer.train_batch_size = batch_size
@@ -527,18 +637,26 @@ async def test_megatron_train(
         assert "policy_lr" in result.metrics
         assert "loss_metrics/clip_ratio" in result.metrics
         assert "policy_entropy" in result.metrics
+        assert result.metrics["policy_entropy"] > 0
         for k, v in result.metrics.items():
             assert isinstance(v, (int, float)), f"{k} should be an int or float"
-
+        if ep > 1:
+            assert "seq_load_balancing_loss" in result.metrics, "Load balancing loss should be present"
+            assert (
+                "moe/seq_load_balancing_loss_layer_0" in result.metrics
+            ), "Load balancing loss layer 0 should be present"
+            assert (
+                "moe/seq_load_balancing_loss_layer_1" in result.metrics
+            ), "Load balancing loss layer 1 should be present"
     ray.shutdown()
     ray_init_for_tests()
 
     cfg.trainer.strategy = "fsdp"
     # NOTE (erictang000): need to set sample packing to false here due to metric calculation differences
-    # between use_sample_packing true/false for FSDP (no diff for megatron)
+    # between remove_microbatch_padding true/false for FSDP (no diff for megatron)
     # this shouldn't be the case, but tracking here: https://github.com/NovaSky-AI/SkyRL/issues/211
     # + tested that this does not affect convergence
-    cfg.trainer.use_sample_packing = False
+    cfg.trainer.remove_microbatch_padding = False
 
     if ep > 1:
         cfg.trainer.policy.fsdp_config.cpu_offload = True
@@ -620,7 +738,7 @@ async def test_megatron_dp(ray_init_fixture, worker_type, tp, pp, gpus_per_node)
     cfg.trainer.micro_train_batch_size_per_gpu = 4
 
     # set torch profiler config
-    cfg.trainer.policy.megatron_config.torch_profiler_config = MegatronTorchProfilerConfig(
+    cfg.trainer.policy.torch_profiler_config = TorchProfilerConfig(
         enable=False, ranks=[0], save_path=f"/home/ray/megatron_prof/tp{tp}_pp{pp}/"
     )
 
@@ -662,7 +780,7 @@ async def test_megatron_dp(ray_init_fixture, worker_type, tp, pp, gpus_per_node)
     cfg.trainer.policy.megatron_config.pipeline_model_parallel_size = 1
 
     # set torch profiler config
-    cfg.trainer.policy.megatron_config.torch_profiler_config = MegatronTorchProfilerConfig(
+    cfg.trainer.policy.torch_profiler_config = TorchProfilerConfig(
         enable=False, ranks=[0], save_path="/home/ray/megatron_prof/dp4/"
     )
 
@@ -702,6 +820,99 @@ async def test_megatron_dp(ray_init_fixture, worker_type, tp, pp, gpus_per_node)
         for k in keys_to_compare:
             assert isinstance(result.metrics[k], (int, float)), f"{k} should be an int or float"
             assert abs(result.metrics[k] - results_megatron[i].metrics[k]) < 1.5e-1, f"diff in {k} is too large!"
+
+
+@pytest.mark.asyncio
+@pytest.mark.megatron
+async def test_megatron_cp_grad_scaling(ray_init_fixture):
+    """
+    Regression test for context-parallel (CP) gradient scaling.
+
+    The policy loss uses a *sum* reduction (the advantage pre-scaling carries the
+    normalization), so the final gradient is the sum over every action token in the
+    global batch and is therefore invariant to how that batch is partitioned across
+    DP and CP. We run the SAME batch on 2 GPUs under two layouts:
+
+        - CP off:  TP1 / PP1 / CP1  -> DP2
+        - CP on:   TP1 / PP1 / CP2  -> DP1   (packed path; CP requires remove_microbatch_padding=True)
+
+    and assert the grad norm matches, and other metrics roughly match.
+    """
+
+    def run(tp, pp, cp):
+        cfg = get_test_actor_config()
+        batch = get_test_training_batch(8)
+
+        cfg.trainer.strategy = "megatron"
+        cfg.trainer.placement.policy_num_gpus_per_node = 2
+        cfg.trainer.policy.megatron_config.tensor_model_parallel_size = tp
+        cfg.trainer.policy.megatron_config.pipeline_model_parallel_size = pp
+        cfg.trainer.policy.megatron_config.context_parallel_size = cp
+        # CP correctness requires the packed/THD logprobs path; the non-packed path
+        # hard-codes cp_group=None. Enable it for both layouts so CP is the only diff.
+        cfg.trainer.remove_microbatch_padding = True
+
+        # Exercise the KL and entropy terms, which previously carried a spurious * cp_size.
+        cfg.trainer.algorithm.use_kl_loss = True
+        cfg.trainer.algorithm.kl_loss_coef = 0.1
+        cfg.trainer.algorithm.use_entropy_loss = True
+        cfg.trainer.algorithm.entropy_loss_coef = 0.01
+
+        cfg.trainer.train_batch_size = 8
+        cfg.trainer.policy_mini_batch_size = len(batch["sequences"])
+        cfg.generator.n_samples_per_prompt = 1
+        cfg.trainer.micro_train_batch_size_per_gpu = 4
+
+        actor_group = init_worker_with_type(
+            "policy",
+            shared_pg=None,
+            colocate_all=False,
+            num_gpus_per_node=cfg.trainer.placement.policy_num_gpus_per_node,
+            cfg=cfg,
+        )
+
+        batch.metadata["global_step"] = 0
+        results = ray.get(actor_group.async_run_ray_method("mesh", "forward_backward", batch))
+        # optim_step returns the per-worker grad norm (before scaling, after clipping);
+        # all ranks report the same value since it's computed after the DDP all-reduce.
+        grad_norms = ray.get(actor_group.async_run_ray_method("pass_through", "optim_step"))
+
+        ray.shutdown()
+        ray_init_for_tests()
+        return results, grad_norms
+
+    results_nocp, grad_norms_nocp = run(tp=1, pp=1, cp=1)
+    results_cp, grad_norms_cp = run(tp=1, pp=1, cp=2)
+
+    print("grad norms (CP off):", grad_norms_nocp)
+    print("grad norms (CP on): ", grad_norms_cp)
+
+    gn_nocp = grad_norms_nocp[0]
+    gn_cp = grad_norms_cp[0]
+    assert gn_nocp is not None and gn_cp is not None, "optim_step should return a grad norm"
+    assert gn_nocp > 0, f"non-CP grad norm should be positive, got {gn_nocp}"
+    # The grad norm is layout-invariant; the old cp_size over-scaling made CP=2 ~2x larger,
+    # so a 10% band cleanly separates numerical noise from the regression.
+    assert abs(gn_cp - gn_nocp) / gn_nocp < 0.1, (
+        f"CP grad norm {gn_cp} differs from non-CP grad norm {gn_nocp} by more than 10% "
+        f"(ratio {gn_cp / gn_nocp:.3f});"
+    )
+
+    # Reported metrics should also match across layouts (validates the logprob/KL/entropy
+    # CP gather in addition to the gradient scaling).
+    keys_to_compare = [
+        "policy_loss",
+        "loss_metrics/clip_ratio",
+        "policy_entropy",
+        "policy_kl",
+    ]
+    print("megatron results (CP off):", results_nocp[0])
+    print("megatron results (CP on): ", results_cp[0])
+    for k in keys_to_compare:
+        v_nocp = results_nocp[0].metrics[k]
+        v_cp = results_cp[0].metrics[k]
+        assert isinstance(v_cp, (int, float)), f"{k} should be an int or float"
+        assert abs(v_cp - v_nocp) < 1.5e-1, f"diff in {k} too large: CP={v_cp} vs non-CP={v_nocp}"
 
 
 @pytest.mark.asyncio
@@ -816,5 +1027,8 @@ async def test_megatron_offload_memory_and_correctness(ray_init_fixture, worker_
         result_backload = results_backload[i]
         for k, v in result.metrics.items():
             assert k in result_backload.metrics
+            # The first optim_step initializes optimizer state, so the second forward_backward has a higher peak.
+            if k in {"peak_mem_allocated_gb_max", "peak_mem_reserved_gb_max"}:
+                continue
             assert v == result_backload.metrics[k], f"Metrics mismatch for {k}: {v} != {result_backload.metrics[k]}"
         assert result.loss_fn_outputs == result_backload.loss_fn_outputs, "loss_fn_outputs mismatch after backload"

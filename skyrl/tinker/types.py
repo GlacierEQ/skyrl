@@ -9,7 +9,7 @@ from enum import Enum
 from typing import Annotated, Any, Literal, TypedDict
 from urllib.parse import urlparse
 
-from pydantic import Base64Bytes, BaseModel, Discriminator, Field
+from pydantic import Base64Bytes, BaseModel, ConfigDict, Discriminator, Field
 
 
 class RequestType(str, Enum):
@@ -61,6 +61,8 @@ class AdamParams(BaseModel):
     beta2: float
     eps: float
     weight_decay: float
+    grad_clip_norm: float = 0.0
+    """0.0 disables clipping, as in the Tinker SDK."""
 
 
 class LoraConfig(BaseModel):
@@ -151,6 +153,7 @@ class LossFnInputs(BaseModel):
     logprobs: TensorData
     values: TensorData = Field(default_factory=lambda: TensorData(data=[]))
     returns: TensorData = Field(default_factory=lambda: TensorData(data=[]))
+    rollout_logprobs: TensorData = Field(default_factory=lambda: TensorData(data=[]))
 
 
 class Datum(BaseModel):
@@ -160,11 +163,13 @@ class Datum(BaseModel):
 
 class ForwardBackwardInput(BaseModel):
     data: list[Datum]
-    loss_fn: Literal["cross_entropy", "importance_sampling", "ppo", "cispo", "ppo_critic"]
+    loss_fn: Literal["cross_entropy", "importance_sampling", "ppo", "gspo", "cispo", "ppo_critic", "dppo"]
     loss_fn_config: dict[str, float] | None = None
 
 
 class ForwardBackwardOutput(BaseModel):
+    model_config = ConfigDict(ser_json_inf_nan="strings")
+
     loss_fn_output_type: str
     loss_fn_outputs: list[dict]
     metrics: dict
@@ -208,6 +213,7 @@ class SaveWeightsOutput(BaseModel):
 class LoadWeightsInput(BaseModel):
     source_model_id: str
     checkpoint_id: str
+    load_optimizer: bool = True
 
 
 class LoadWeightsOutput(BaseModel):
@@ -230,6 +236,24 @@ class ModelMetadata(BaseModel):
     loaded_checkpoint_id: str | None = None
 
 
+def make_routing_session_id(sampling_session_id: str | None, seq_id: int | None) -> str | None:
+    """Stable per-request routing key for the ``X-Session-ID`` header, or None.
+
+    Combines the (per-client) ``sampling_session_id`` with the (per-request)
+    ``seq_id`` into the "deterministic request id" the Tinker SDK describes.
+    Used to pin all of one logical sample's traffic (including retries) to a
+    single inference backend while still spreading distinct requests across
+    backends.
+
+    Returns None when either input is absent (e.g. direct base-model sampling
+    with no SDK session), in which case callers omit the header and fall back to
+    plain load-balancing.
+    """
+    if sampling_session_id is None or seq_id is None:
+        return None
+    return f"{sampling_session_id}:{seq_id}"
+
+
 class SampleInput(BaseModel):
     base_model: str | None = None
     prompt: ModelInput
@@ -237,6 +261,11 @@ class SampleInput(BaseModel):
     num_samples: int
     checkpoint_id: str
     prompt_logprobs: bool
+    # Number of top logprobs to return per prompt position (0 disables).
+    topk_prompt_logprobs: int = 0
+    # See make_routing_session_id.
+    seq_id: int | None = None
+    sampling_session_id: str | None = None
 
 
 class GeneratedSequence(BaseModel):
@@ -247,7 +276,13 @@ class GeneratedSequence(BaseModel):
 
 class SampleOutput(BaseModel):
     sequences: list[GeneratedSequence]
-    prompt_logprobs: list[float] | None = None
+    # One entry per prompt token. Entries are None where the logprob is
+    # undefined (the first prompt token has no preceding context).
+    prompt_logprobs: list[float | None] | None = None
+    # One entry per prompt token, each a list of (token_id, logprob) pairs
+    # (None where logprobs are undefined). Only set when the request asked
+    # for topk_prompt_logprobs > 0.
+    topk_prompt_logprobs: list[list[tuple[int, float]] | None] | None = None
 
 
 # Metrics tracked in the engine
@@ -274,6 +309,9 @@ class PreparedModelPassBatch(BaseModel):
     all_advantages: list[list[float]]
     all_values: list[list[float]]
     all_returns: list[list[float]]
+    all_rollout_logprobs: list[list[float]] = Field(default_factory=list)
+    """Per-example rollout-engine logprobs (see ``LossFnInputs.rollout_logprobs``). Empty
+    inner lists mean "not provided" for that example."""
 
     # Per-example scalars
     all_model_ids: list[str]
@@ -296,12 +334,15 @@ class PreparedSampleBatch(BaseModel):
     all_model_ids: list[str]
     all_checkpoint_ids: list[str]
     all_checkpoint_paths: list[str]
+    # Routing key per sample
+    all_session_ids: list[str | None]
 
     # Whether any request needs prompt logprobs
     needs_prompt_logprobs: bool
 
-    # Mapping from samples back to requests: (request_id, model_id, start_idx, end_idx, prompt_logprobs_requested)
-    request_batch_slices: list[tuple[str, str, int, int, bool]]
+    # Mapping from samples back to requests:
+    # (request_id, model_id, start_idx, end_idx, prompt_logprobs_requested, topk_prompt_logprobs)
+    request_batch_slices: list[tuple[str, str, int, int, bool, int]]
 
 
 # All accepted loss functions across backends.
@@ -309,8 +350,10 @@ SUPPORTED_LOSS_FNS = {
     "cross_entropy",
     "importance_sampling",
     "ppo",
+    "gspo",
     "cispo",
     "ppo_critic",
+    "dppo",
 }
 
 # Loss function type mappings used by the JAX backend dispatch path.

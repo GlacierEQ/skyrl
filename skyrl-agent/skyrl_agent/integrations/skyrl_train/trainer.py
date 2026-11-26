@@ -26,7 +26,7 @@ from skyrl.train.generators.base import (
     BatchMetadata,
     TrainingPhase,
 )
-from skyrl.backends.skyrl_train.inference_engines.utils import get_sampling_params_for_backend
+from skyrl.backends.skyrl_train.inference_servers.engine_utils import get_sampling_params_for_backend
 from skyrl.train.dataset import PromptDataset
 
 from pathlib import Path
@@ -169,11 +169,10 @@ def build_dataloader(
         batch_size=batch_size if not is_fully_async else 1,
         shuffle=True if is_train else False,
         collate_fn=dataset.collate_fn,
-        # TODO(Charlie): debug why inference http endpoint is slow when num_workers is 8
-        num_workers=0 if cfg.generator.inference_engine.enable_http_endpoint else 8,
+        num_workers=8,
         drop_last=True if is_train else False,
         generator=seeded_generator,
-        multiprocessing_context="spawn" if not cfg.generator.inference_engine.enable_http_endpoint else None,
+        multiprocessing_context="spawn",
     )
     if is_train:
         if not is_fully_async:
@@ -380,6 +379,7 @@ class SkyRLAgentPPOTrainer(RayPPOTrainer):
                     # Policy model is backloaded to GPU during training
                     with Timer("train_critic_and_policy", self.all_timings):
                         status = self.train_critic_and_policy(training_input)
+                    self.all_metrics.update(self.policy_mfu_metrics(training_input))
 
                     # 5. conditionally save checkpoints and hf model
                     if self.cfg.trainer.ckpt_interval > 0 and self.global_step % self.cfg.trainer.ckpt_interval == 0:

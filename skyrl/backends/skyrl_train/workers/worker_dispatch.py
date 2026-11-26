@@ -8,32 +8,39 @@ Automatically handles GPU placement:
 The trainer interacts with the worker dispatch if all models are always on GPU.
 """
 
+import asyncio
+import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
-import ray
+from loguru import logger
 from ray import ObjectRef
 
 from skyrl.backends.skyrl_train.distributed.dispatch import (
     MeshDispatch,
+    OrderedRefs,
     WorkerOutput,
-)
-from skyrl.backends.skyrl_train.inference_engines.inference_engine_client import (
-    InferenceEngineClient,
 )
 from skyrl.backends.skyrl_train.training_batch import (
     TrainingInputBatch,
 )
 from skyrl.backends.skyrl_train.workers.worker import PPORayActorGroup
 from skyrl.train.config import SkyRLTrainConfig
+from skyrl.train.utils import deadline
+from skyrl.train.utils.async_utils import cleanup_preserving_primary
+
+if TYPE_CHECKING:
+    from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
+        RemoteInferenceClient,
+    )
 
 
 @dataclass
 class GPUState:
     """Tracks what's on GPU for a model."""
 
-    model_on_gpu: bool = False
-    optimizer_on_gpu: bool = False
+    model_on_gpu: bool
+    optimizer_on_gpu: bool
 
 
 class WorkerDispatch:
@@ -49,7 +56,7 @@ class WorkerDispatch:
         policy_actor_group: PPORayActorGroup,
         critic_actor_group: Optional[PPORayActorGroup] = None,
         ref_actor_group: Optional[PPORayActorGroup] = None,
-        inference_engine_client: Optional[InferenceEngineClient] = None,
+        inference_engine_client: "Optional[RemoteInferenceClient]" = None,
     ):
         self.cfg = cfg
         self.colocate_all = cfg.trainer.placement.colocate_all
@@ -57,6 +64,10 @@ class WorkerDispatch:
 
         # Inference engine client for weight sync (optional)
         self._inference_engine_client = inference_engine_client
+
+        # Seconds the last save_weights_for_sampler spent on the transfer itself,
+        # excluding the pause/resume bracket. None until the first sync.
+        self.last_weight_sync_seconds: Optional[float] = None
 
         # Actor groups by name.
         # TODO: Remove these role-specific identifiers. We will move to using model IDs and add support for generic models beyond these.
@@ -66,29 +77,58 @@ class WorkerDispatch:
         if ref_actor_group is not None:
             self._actor_groups["ref"] = ref_actor_group
 
-        # GPU state tracking (only matters when colocated)
-        self._gpu_state: Dict[str, GPUState] = {name: GPUState() for name in self._actor_groups.keys()}
+        # GPU state tracking (only matters when colocated). Every caller builds and
+        # initializes its actor groups on GPU before constructing the dispatch;
+        # colocated callers offload first and then immediately mark_all_offloaded(),
+        # so "resident" is the correct starting assumption here.
+        self._gpu_state: Dict[str, GPUState] = {
+            name: GPUState(model_on_gpu=True, optimizer_on_gpu=(name != "ref")) for name in self._actor_groups.keys()
+        }
+
+    @property
+    def _dp_balance_tokens(self) -> bool:
+        """True when ``trainer.balance_dp_tokens`` is on.
+
+        With False, dispatch, staging and output collection behave exactly as they did before
+        the token-balanced split existed.
+        """
+        trainer_cfg = getattr(getattr(self, "cfg", None), "trainer", None)
+        return getattr(trainer_cfg, "balance_dp_tokens", False) is True
 
     def register_actor_group(self, model: str, actor_group: PPORayActorGroup) -> None:
         self._actor_groups[model] = actor_group
-        self._gpu_state[model] = GPUState()
+        # Not initialized yet -- callers register, then call init_model(), which
+        # records the model as resident.
+        self._gpu_state[model] = GPUState(model_on_gpu=False, optimizer_on_gpu=False)
+
+    def unregister_actor_group(self, model: str) -> None:
+        """Undo ``register_actor_group``, e.g. after the model failed to initialize. Does not stop its workers."""
+        self._actor_groups.pop(model, None)
+        self._gpu_state.pop(model, None)
 
     # ------------------------------------------------------------------
     # Multi-LoRA: per-model adapter swap orchestration.
     # ------------------------------------------------------------------
 
-    def ensure_active_adapter(self, role: str, model_id: Optional[str]) -> None:
+    def ensure_active_adapter(self, role: str, model_id: Optional[str], require_model_resident: bool = True) -> None:
         """Make ``model_id`` the live LoRA adapter for ``role`` workers.
 
         No-op when ``model_id is None`` (single-tenant / FFT path) or when
         the workers don't have an AdapterStore (non-LoRA strategies).
 
-        Must be called *after* ``_ensure_on_gpu(role, ...)`` so the model
-        and optimizer storages are live before we tensor.copy_() into them.
+        By default the swap ensures the model is GPU-resident because
+        AdapterStore copies DDP param buffers. The Megatron adapter-only sync
+        path can skip that backload: Megatron LoRA offload keeps the LoRA DDP
+        buffers resident even when frozen base weights are offloaded.
         """
         if model_id is None or role not in self._actor_groups:
             return
-        ray.get(self._actor_groups[role].async_run_ray_method("pass_through", "swap_to_adapter", model_id))
+        if require_model_resident:
+            self._ensure_on_gpu(role, need_optimizer=False, need_model=True)
+        deadline.ray_get(
+            self._actor_groups[role].async_run_ray_method("pass_through", "swap_to_adapter", model_id),
+            "swap_to_adapter",
+        )
 
     def register_adapter(self, role: str, model_id: str) -> None:
         """Register a new adapter slot on every worker (subsequent
@@ -96,27 +136,32 @@ class WorkerDispatch:
         """
         if role not in self._actor_groups:
             return
-        ray.get(self._actor_groups[role].async_run_ray_method("pass_through", "register_adapter", model_id))
+        deadline.ray_get(
+            self._actor_groups[role].async_run_ray_method("pass_through", "register_adapter", model_id),
+            "register_adapter",
+        )
 
     def delete_adapter(self, role: str, model_id: str) -> None:
         if role not in self._actor_groups:
             return
-        ray.get(self._actor_groups[role].async_run_ray_method("pass_through", "delete_adapter", model_id))
+        deadline.ray_get(
+            self._actor_groups[role].async_run_ray_method("pass_through", "delete_adapter", model_id), "delete_adapter"
+        )
 
     def get_lcm_dp_size(self) -> int:
         """Get LCM of all models' dp_size."""
         import math
 
-        dp_size = self._actor_groups["policy"].actor_infos[0].rank.dp_size
+        dp_size = self._actor_groups["policy"].get_dp_size()
         if "critic" in self._actor_groups:
-            dp_size = math.lcm(dp_size, self._actor_groups["critic"].actor_infos[0].rank.dp_size)
+            dp_size = math.lcm(dp_size, self._actor_groups["critic"].get_dp_size())
         if "ref" in self._actor_groups:
-            dp_size = math.lcm(dp_size, self._actor_groups["ref"].actor_infos[0].rank.dp_size)
+            dp_size = math.lcm(dp_size, self._actor_groups["ref"].get_dp_size())
         return dp_size
 
     def dp_size(self, model: str) -> int:
         """Return the data-parallel size for ``model`` (e.g. "policy")."""
-        return self._actor_groups[model].actor_infos[0].rank.dp_size
+        return self._actor_groups[model].get_dp_size()
 
     def _should_manage_offload(self, model: str) -> bool:
         """Check if we need to manage offload for this model."""
@@ -134,6 +179,11 @@ class WorkerDispatch:
             return [m for m in ["policy", "ref"] if m in self._actor_groups]
         return [model]
 
+    def _offload_inactive_model(self, model: str) -> None:
+        """Offload an inactive colocated model to CPU."""
+        self._actor_groups[model].offload_to_cpu()
+        self._gpu_state[model] = GPUState(model_on_gpu=False, optimizer_on_gpu=False)
+
     def _ensure_on_gpu(self, model: str, need_optimizer: bool = True, need_model: bool = True) -> None:
         """Ensure model is on GPU, offloading others in same colocation group if needed."""
         if not self._should_manage_offload(model):
@@ -144,26 +194,27 @@ class WorkerDispatch:
 
         group = self._get_colocation_group(model)
 
-        # Offload others in the same colocation group
+        # Offload others in the same colocation group.
         for other in group:
             if other != model and other in self._actor_groups:
                 state = self._gpu_state[other]
                 if state.model_on_gpu or state.optimizer_on_gpu:
-                    self._actor_groups[other].offload_to_cpu()
-                    self._gpu_state[other] = GPUState()
+                    self._offload_inactive_model(other)
 
-        # Backload requested model
+        # Reload only missing state; model weights may remain resident while the
+        # optimizer is offloaded.
         state = self._gpu_state[model]
-        needs_backload = (need_model and not state.model_on_gpu) or (need_optimizer and not state.optimizer_on_gpu)
+        backload_model = need_model and not state.model_on_gpu
+        backload_optimizer = need_optimizer and not state.optimizer_on_gpu
 
-        if needs_backload:
+        if backload_model or backload_optimizer:
             self._actor_groups[model].backload_to_gpu(
-                backload_optimizer=need_optimizer,
-                backload_model=need_model,
+                backload_optimizer=backload_optimizer,
+                backload_model=backload_model,
             )
-            if need_model:
+            if backload_model:
                 self._gpu_state[model].model_on_gpu = True
-            if need_optimizer:
+            if backload_optimizer:
                 self._gpu_state[model].optimizer_on_gpu = True
 
     def _offload(self, model: str, offload_optimizer: bool = True, offload_model: bool = True) -> None:
@@ -184,6 +235,20 @@ class WorkerDispatch:
         if offload_optimizer:
             self._gpu_state[model].optimizer_on_gpu = False
 
+    def offload_for_sampling(self) -> None:
+        """Fully offload every colocated trainer model so inference engines can reclaim VRAM.
+
+        Used by cold sample paths (no preceding weight sync): the engines are
+        woken directly, so any model left GPU-resident by a forward/optim op
+        (policy, critic, ...) must first move to CPU. No-op when nothing is on
+        the GPU.
+        """
+        if not self.colocate_all:
+            return
+        for model, state in self._gpu_state.items():
+            if state.model_on_gpu or state.optimizer_on_gpu:
+                self._offload(model, offload_optimizer=True, offload_model=True)
+
     def mark_all_offloaded(self) -> None:
         """Mark all models as offloaded (call after build_models when colocate_all)."""
         for model in self._actor_groups:
@@ -193,7 +258,7 @@ class WorkerDispatch:
         """Mark a specific model as offloaded without changing others."""
         if model not in self._actor_groups:
             return
-        self._gpu_state[model] = GPUState()
+        self._gpu_state[model] = GPUState(model_on_gpu=False, optimizer_on_gpu=False)
 
     def forward(
         self,
@@ -202,6 +267,7 @@ class WorkerDispatch:
         loss_fn: Optional[str] = None,
         loss_fn_config: Optional[Dict[str, Any]] = None,
         model_id: Optional[str] = None,
+        **worker_kwargs,
     ) -> WorkerOutput:
         """Run forward pass. Only loads model (not optimizer).
 
@@ -222,27 +288,84 @@ class WorkerDispatch:
             loss_fn_config: Optional config overrides for the loss function.
             model_id: Optional Tinker model_id; when set, the corresponding LoRA adapter
                      is swapped in before the forward.
+            worker_kwargs: Extra worker-type-specific keyword arguments passed
+                     through to the worker's ``forward`` (e.g.
+                     ``return_per_token_outputs=False`` for the policy worker).
         """
         self._ensure_on_gpu(model, need_optimizer=False, need_model=True)
         self.ensure_active_adapter(model, model_id)
 
-        kwargs = {}
+        kwargs = dict(worker_kwargs)
         if loss_fn is not None:
             kwargs["loss_fn"] = loss_fn
         if loss_fn_config is not None:
             kwargs["loss_fn_config"] = loss_fn_config
 
-        refs = self._actor_groups[model].async_run_ray_method("mesh", "forward", data=data, **kwargs)
-        results = ray.get(refs)
+        refs = self._actor_groups[model].async_run_ray_method(
+            "mesh", "forward", data=data, dp_balance_tokens=self._dp_balance_tokens, **kwargs
+        )
+        results = deadline.ray_get(refs, "forward")
 
-        return WorkerOutput.cat(self._actor_groups[model].actor_infos, results)
+        return WorkerOutput.cat(
+            self._actor_groups[model].actor_infos, results, sample_order=getattr(refs, "sample_order", None)
+        )
+
+    def forward_from_staged(
+        self,
+        model: str,
+        chunk_refs: List[ObjectRef],
+        loss_fn: Optional[str] = None,
+        loss_fn_config: Optional[Dict[str, Any]] = None,
+        model_id: Optional[str] = None,
+        **worker_kwargs,
+    ) -> WorkerOutput:
+        """Run a forward pass using pre-staged per-DP chunks.
+
+        Consumes per-DP chunks already placed in the object store by :meth:`stage_data`, so
+        serialization of the per-mini-batch chunks is amortized off the dispatch critical path
+        across mini-batches (see :meth:`forward_backward_from_staged`). The chunks are produced
+        exactly as in :meth:`stage_data`, so the per-rank partition (and thus the microbatch packing)
+        matches what ``forward_backward`` sees for the same mini-batch.
+
+        Args:
+            model: Model identifier ("policy", "critic", or "ref")
+            chunk_refs: Pre-staged ObjectRefs, one per DP rank (from ``stage_data``)
+            loss_fn: Optional resolved loss function name. When set, the worker computes
+                     loss + per-sample outputs without backward (no_grad).
+            loss_fn_config: Optional config overrides for the loss function.
+            model_id: Optional Tinker model_id; selects the LoRA adapter before the forward.
+            worker_kwargs: Extra worker-type-specific keyword arguments passed
+                     through to the worker's ``forward``.
+
+        Returns:
+            :class:`WorkerOutput` aggregated across DP ranks.
+        """
+        self._ensure_on_gpu(model, need_optimizer=False, need_model=True)
+        self.ensure_active_adapter(model, model_id)
+
+        kwargs = dict(worker_kwargs)
+        if loss_fn is not None:
+            kwargs["loss_fn"] = loss_fn
+        if loss_fn_config is not None:
+            kwargs["loss_fn_config"] = loss_fn_config
+
+        refs = MeshDispatch.dispatch_from_staged(
+            self._actor_groups[model].actor_infos,
+            "forward",
+            chunk_refs=chunk_refs,
+            **kwargs,
+        )
+        results = deadline.ray_get(refs, "forward")
+        return WorkerOutput.cat(
+            self._actor_groups[model].actor_infos, results, sample_order=getattr(chunk_refs, "sample_order", None)
+        )
 
     def stage_data(
         self,
         model: str,
         data: TrainingInputBatch,
         mini_batch_boundaries: List[Tuple[int, int]],
-    ) -> List[List[ObjectRef]]:
+    ) -> List[OrderedRefs]:
         """Pre-stage mini-batch chunks in the Ray object store.
 
         Call this once before the training loop so that all serialization is
@@ -255,10 +378,13 @@ class WorkerDispatch:
                 The i-th mini-batch is data[mini_batch_boundaries[i][0]:mini_batch_boundaries[i][1]].
 
         Returns:
-            ``result[i][dp_rank]`` - ObjectRef for mini-batch *i*, DP rank *dp_rank*.
+            ``result[i][dp_rank]`` - ObjectRef for mini-batch *i*, DP rank *dp_rank*. Each
+            ``result[i]`` carries the sample order of mini-batch *i*.
         """
         dp_size = self._actor_groups[model].actor_infos[0].rank.dp_size
-        return MeshDispatch.stage_chunks(dp_size, data, mini_batch_boundaries)
+        return MeshDispatch.stage_chunks(
+            dp_size, data, mini_batch_boundaries, dp_balance_tokens=self._dp_balance_tokens
+        )
 
     def forward_backward(
         self,
@@ -267,6 +393,7 @@ class WorkerDispatch:
         loss_fn: Optional[str] = None,
         loss_fn_config: Optional[Dict[str, Any]] = None,
         model_id: Optional[str] = None,
+        **worker_kwargs,
     ) -> WorkerOutput:
         """Run forward/backward pass. Needs model + optimizer.
 
@@ -280,6 +407,9 @@ class WorkerDispatch:
                            (e.g., {"eps_clip_low": 0.1} for the regular PPO loss)
             model_id: Optional Tinker model_id; when set, the corresponding
                      LoRA adapter is swapped in before the forward/backward.
+            worker_kwargs: Extra worker-type-specific keyword arguments passed
+                     through to the worker's ``forward_backward`` (e.g.
+                     ``return_per_token_outputs=False`` for the policy worker).
 
         Returns:
             :class:`WorkerOutput` with per-sample ``loss_fn_outputs`` aggregated
@@ -289,18 +419,22 @@ class WorkerDispatch:
         self.ensure_active_adapter(model, model_id)
 
         # Only pass kwargs that are not None (critic worker doesn't accept loss_fn)
-        kwargs = {}
+        kwargs = dict(worker_kwargs)
         if loss_fn is not None:
             kwargs["loss_fn"] = loss_fn
         if loss_fn_config is not None:
             kwargs["loss_fn_config"] = loss_fn_config
 
-        refs = self._actor_groups[model].async_run_ray_method("mesh", "forward_backward", data, **kwargs)
-        statuses = ray.get(refs)
+        refs = self._actor_groups[model].async_run_ray_method(
+            "mesh", "forward_backward", data, dp_balance_tokens=self._dp_balance_tokens, **kwargs
+        )
+        statuses = deadline.ray_get(refs, "forward_backward")
 
         self._save_memory_snapshot(model, "forward_backward")
 
-        return WorkerOutput.cat(self._actor_groups[model].actor_infos, statuses)
+        return WorkerOutput.cat(
+            self._actor_groups[model].actor_infos, statuses, sample_order=getattr(refs, "sample_order", None)
+        )
 
     def forward_backward_from_staged(
         self,
@@ -309,6 +443,7 @@ class WorkerDispatch:
         loss_fn: Optional[str] = None,
         loss_fn_config: Optional[Dict[str, Any]] = None,
         model_id: Optional[str] = None,
+        **worker_kwargs,
     ) -> WorkerOutput:
         """
         Run forward/backward pass using pre-staged per-DP chunks.
@@ -319,6 +454,8 @@ class WorkerDispatch:
         Args:
             model: Model name ("policy" or "critic")
             chunk_refs: Pre-staged ObjectRefs, one per DP rank (from ``stage_data``)
+            worker_kwargs: Extra worker-type-specific keyword arguments passed
+                     through to the worker's ``forward_backward``.
 
         Returns:
             :class:`WorkerOutput` with per-sample ``loss_fn_outputs`` aggregated
@@ -328,7 +465,7 @@ class WorkerDispatch:
         self.ensure_active_adapter(model, model_id)
 
         # Only pass kwargs that are not None (critic worker doesn't accept loss_fn)
-        kwargs = {}
+        kwargs = dict(worker_kwargs)
         if loss_fn is not None:
             kwargs["loss_fn"] = loss_fn
         if loss_fn_config is not None:
@@ -340,42 +477,193 @@ class WorkerDispatch:
             chunk_refs=chunk_refs,
             **kwargs,
         )
-        statuses = ray.get(refs)
+        statuses = deadline.ray_get(refs, "forward_backward")
 
         self._save_memory_snapshot(model, "forward_backward")
-        return WorkerOutput.cat(self._actor_groups[model].actor_infos, statuses)
+        return WorkerOutput.cat(
+            self._actor_groups[model].actor_infos, statuses, sample_order=getattr(chunk_refs, "sample_order", None)
+        )
 
     def optim_step(self, model: str, model_id: Optional[str] = None) -> Optional[float]:
         """Run optimizer step. For single-tenant training, the model should already be on GPU from forward_backward.
 
         For multi-tenant LoRA training, ``model_id`` is used to ensure the correct adapter is used.
+
+        The residency check is not redundant with forward_backward's: under
+        multi-tenancy another tenant's request can offload the optimizer
+        between the two calls.
         """
+        self._ensure_on_gpu(model, need_optimizer=True, need_model=True)
         self.ensure_active_adapter(model, model_id)
         refs = self._actor_groups[model].async_run_ray_method("pass_through", "optim_step")
-        grad_norms = ray.get(refs)
+        grad_norms = deadline.ray_get(refs, "optim_step")
 
         self._save_memory_snapshot(model, "optim_step")
         return grad_norms[0]
 
-    def set_lr(self, model: str, learning_rate: float, model_id: Optional[str] = None) -> None:
-        """Set learning rate for model's optimizer.
+    def set_optimizer_hparams(self, model: str, adam_params, model_id: Optional[str] = None) -> None:
+        """Apply the request's AdamParams to the model's optimizer on all workers.
 
-        This directly updates the optimizer's param_groups on all workers,
-        bypassing the scheduler. Useful for external learning rate schedules.
+        lr, betas, eps and weight_decay are written into the optimizer's param groups
+        (replacing the scheduler-managed lr), and grad_clip_norm becomes the per-step
+        clip. Directly updates the param_groups, bypassing the scheduler; useful for
+        external optimization schedules (e.g. from Tinker).
         """
         self._ensure_on_gpu(model, need_optimizer=True, need_model=False)
         self.ensure_active_adapter(model, model_id)
-        ray.get(self._actor_groups[model].async_run_ray_method("pass_through", "set_lr", learning_rate=learning_rate))
+        deadline.ray_get(
+            self._actor_groups[model].async_run_ray_method(
+                "pass_through", "set_optimizer_hparams", adam_params=adam_params
+            ),
+            "set_optimizer_hparams",
+        )
 
     def set_algorithm_config(self, model: str, **kwargs) -> None:
         """Update algorithm config fields on all workers for a model."""
         self._ensure_on_gpu(model, need_optimizer=False, need_model=False)
-        ray.get(self._actor_groups[model].async_run_ray_method("pass_through", "set_algorithm_config", **kwargs))
+        deadline.ray_get(
+            self._actor_groups[model].async_run_ray_method("pass_through", "set_algorithm_config", **kwargs),
+            "set_algorithm_config",
+        )
+
+    # ------------------------------------------------------------------
+    # torch.profiler control. Avoid _ensure_on_gpu so profiling does not perturb
+    # the colocation offload state.
+    # ------------------------------------------------------------------
+
+    def start_profile(self, model: str, config: Optional[dict] = None, raise_on_error: bool = False) -> None:
+        """Start profiling on ``model`` workers.
+
+        ``config`` builds the profiler on the workers (Tinker path); omit it to
+        arm a statically configured one (trainer path).
+
+        Failures are swallowed by default: a broken profiler must never kill a
+        training run. Callers that report the outcome to a user — the Tinker
+        endpoints — pass ``raise_on_error=True``, since a start that silently
+        failed would otherwise be reported as success.
+        """
+        if model not in self._actor_groups:
+            if raise_on_error:
+                raise ValueError(f"no actor group registered for model {model!r}")
+            return
+        try:
+            deadline.ray_get(
+                self._actor_groups[model].async_run_ray_method("pass_through", "start_profile", config),
+                "start_profile",
+            )
+        except deadline.StepTimeoutError:
+            raise
+        except Exception as e:
+            if raise_on_error:
+                raise
+            logger.warning(f"[profiler] start_profile dispatch for {model} failed: {e}")
+
+    def profile_step(self, model: str) -> Optional[List[Optional[str]]]:
+        """Advance profiling by one global step, returning per-rank errors."""
+        if model not in self._actor_groups:
+            return None
+        try:
+            return deadline.ray_get(
+                self._actor_groups[model].async_run_ray_method("pass_through", "profile_step"), "profile_step"
+            )
+        except deadline.StepTimeoutError:
+            raise
+        except Exception as e:
+            logger.warning(f"[profiler] profile_step dispatch for {model} failed: {e}")
+            return None
+
+    def stop_profile(self, model: str, raise_on_error: bool = False) -> None:
+        """Stop profiling on ``model`` workers."""
+        if model not in self._actor_groups:
+            if raise_on_error:
+                raise ValueError(f"no actor group registered for model {model!r}")
+            return
+        try:
+            deadline.ray_get(
+                self._actor_groups[model].async_run_ray_method("pass_through", "stop_profile"), "stop_profile"
+            )
+        except deadline.StepTimeoutError:
+            raise
+        except Exception as e:
+            if raise_on_error:
+                raise
+            logger.warning(f"[profiler] stop_profile dispatch for {model} failed: {e}")
+
+    def dump_profiler_summary(self, model: str) -> Optional[List]:
+        """Collect per-rank last-window kernel summaries for ``model``."""
+        if model not in self._actor_groups:
+            return None
+        try:
+            return deadline.ray_get(
+                self._actor_groups[model].async_run_ray_method("pass_through", "dump_profiler_summary"),
+                "dump_profiler_summary",
+            )
+        except deadline.StepTimeoutError:
+            raise
+        except Exception as e:
+            logger.warning(f"[profiler] dump_profiler_summary dispatch for {model} failed: {e}")
+            return None
+
+    def get_device_name(self, model: str) -> str:
+        """Returns the CUDA device name of ``model``'s first worker, or ``""`` if the call fails."""
+        actor = self._actor_groups[model]._actor_handlers[0]
+        try:
+            return deadline.ray_get(actor.get_device_name.remote(), "get_device_name")
+        except deadline.StepTimeoutError:
+            raise
+        except Exception as e:
+            logger.warning(f"[mfu] get_device_name dispatch for {model} failed: {e}")
+            return ""
+
+    def pop_train_compute_seconds(self, model: str) -> Optional[float]:
+        """Returns the slowest worker's seconds in ``forward_backward`` and ``optim_step``.
+
+        Counts time since the previous call and resets every worker's count. Returns None when the
+        backend doesn't track it or the call fails; this is telemetry.
+        """
+        if model not in self._actor_groups:
+            return None
+        refs = self._actor_groups[model].async_run_ray_method("pass_through", "pop_train_compute_seconds")
+        try:
+            seconds = [s for s in deadline.ray_get(refs, "pop_train_compute_seconds") if s is not None]
+        except deadline.StepTimeoutError:
+            raise
+        except Exception as e:
+            logger.warning(f"[mfu] pop_train_compute_seconds dispatch for {model} failed: {e}")
+            return None
+        return max(seconds) if seconds else None
+
+    def model_flops(
+        self, model: str, num_seqs: int, seqlen_sum: int, seqlen_squared_sum: int
+    ) -> Optional[Dict[str, float]]:
+        """Returns the forward + backward model FLOPs of a batch with these per-document statistics.
+
+        Every rank holds the same model config, so only the first worker is asked. Returns None
+        when the backend can't estimate FLOPs or the call fails; this is telemetry.
+        """
+        if model not in self._actor_groups:
+            return None
+        actor = self._actor_groups[model]._actor_handlers[0]
+        try:
+            return deadline.ray_get(
+                actor.model_flops.remote(
+                    num_seqs=num_seqs, seqlen_sum=seqlen_sum, seqlen_squared_sum=seqlen_squared_sum
+                ),
+                "model_flops",
+            )
+        except deadline.StepTimeoutError:
+            raise
+        except Exception as e:
+            logger.warning(f"[mfu] model_flops dispatch for {model} failed: {e}")
+            return None
 
     def _save_memory_snapshot(self, model: str, tag: str) -> None:
         """Save memory snapshot on workers."""
-        ray.get(
-            self._actor_groups[model].async_run_ray_method("pass_through", "save_memory_snapshot", tag=f"{model}_{tag}")
+        deadline.ray_get(
+            self._actor_groups[model].async_run_ray_method(
+                "pass_through", "save_memory_snapshot", tag=f"{model}_{tag}"
+            ),
+            "save_memory_snapshot",
         )
 
     def save_checkpoint(self, model: str, ckpt_dir: str, tokenizer=None, model_id: Optional[str] = None) -> None:
@@ -383,10 +671,25 @@ class WorkerDispatch:
         self._ensure_on_gpu(model, need_optimizer=True, need_model=True)
         self.ensure_active_adapter(model, model_id)
 
-        ray.get(
+        deadline.ray_get(
             self._actor_groups[model].async_run_ray_method(
                 "pass_through", "save_checkpoint", ckpt_dir=ckpt_dir, tokenizer=tokenizer
-            )
+            ),
+            "save_checkpoint",
+        )
+
+    def finalize_pending_saves(self, model: str) -> None:
+        """Block until any in-flight async checkpoint write for ``model`` completes."""
+        deadline.ray_get(
+            self._actor_groups[model].async_run_ray_method("pass_through", "finalize_pending_saves"),
+            "finalize_pending_saves",
+        )
+
+    def release_optimizer_state_files(self, model: str) -> None:
+        """Delete ``model``'s optimizer state files at the end of training (no-op unless it keeps any)."""
+        deadline.ray_get(
+            self._actor_groups[model].async_run_ray_method("pass_through", "release_optimizer_state_files"),
+            "release_optimizer_state_files",
         )
 
     def load_checkpoint(
@@ -401,21 +704,25 @@ class WorkerDispatch:
         self._ensure_on_gpu(model, need_optimizer=load_optimizer_states, need_model=True)
         self.ensure_active_adapter(model, model_id)
 
-        ray.get(
+        deadline.ray_get(
             self._actor_groups[model].async_run_ray_method(
                 "pass_through",
                 "load_checkpoint",
                 ckpt_dir=ckpt_dir,
                 load_optimizer_states=load_optimizer_states,
                 load_lr_scheduler_states=load_lr_scheduler_states,
-            )
+            ),
+            "load_checkpoint",
         )
 
     def save_hf_model(self, model: str, export_dir: str, tokenizer) -> None:
         """Save model in HuggingFace format."""
         self._ensure_on_gpu(model, need_optimizer=False, need_model=True)
 
-        ray.get(self._actor_groups[model].async_run_ray_method("pass_through", "save_hf_model", export_dir, tokenizer))
+        deadline.ray_get(
+            self._actor_groups[model].async_run_ray_method("pass_through", "save_hf_model", export_dir, tokenizer),
+            "save_hf_model",
+        )
 
     def init_model(self, model: str, model_path: str, num_training_steps: Optional[int] = None) -> None:
         """Initialize model from path. Offloads others in colocation group first."""
@@ -426,20 +733,19 @@ class WorkerDispatch:
                 if other != model and other in self._actor_groups:
                     state = self._gpu_state[other]
                     if state.model_on_gpu or state.optimizer_on_gpu:
-                        self._actor_groups[other].offload_to_cpu()
-                        self._gpu_state[other] = GPUState()
+                        self._offload_inactive_model(other)
 
         kwargs = {"model_path": model_path}
         if num_training_steps is not None:
             kwargs["num_training_steps"] = num_training_steps
 
-        ray.get(self._actor_groups[model].async_init_model(**kwargs))
+        deadline.ray_get(self._actor_groups[model].async_init_model(**kwargs), "init_model")
 
         # After init, model is on GPU
         self._gpu_state[model].model_on_gpu = True
         self._gpu_state[model].optimizer_on_gpu = model != "ref"  # ref has no optimizer
 
-    def set_inference_engine_client(self, inference_engine_client: InferenceEngineClient) -> None:
+    def set_inference_engine_client(self, inference_engine_client: "RemoteInferenceClient") -> None:
         """Set the inference engine client for weight sync.
 
         This can be called after construction if the client isn't available at init time.
@@ -449,18 +755,22 @@ class WorkerDispatch:
     def empty_cache(self, model: Optional[str] = None) -> None:
         """Empty GPU cache for model(s)."""
         if model is not None:
-            ray.get(self._actor_groups[model].async_run_ray_method("pass_through", "empty_cache"))
+            deadline.ray_get(
+                self._actor_groups[model].async_run_ray_method("pass_through", "empty_cache"), "empty_cache"
+            )
         else:
             refs = []
             for group in self._actor_groups.values():
                 refs.extend(group.async_run_ray_method("pass_through", "empty_cache"))
-            ray.get(refs)
+            deadline.ray_get(refs, "empty_cache")
 
     def get_node_ids(self) -> List[str]:
         """Get unique node IDs from all actor groups."""
         all_node_ids = []
         for group in self._actor_groups.values():
-            node_ids = ray.get(group.async_run_ray_method("pass_through", "get_ray_node_id"))
+            node_ids = deadline.ray_get(
+                group.async_run_ray_method("pass_through", "get_ray_node_id"), "get_ray_node_id"
+            )
             all_node_ids.extend(node_ids)
         return list(set(all_node_ids))
 
@@ -470,13 +780,14 @@ class WorkerDispatch:
 
     def init_weight_sync_state(self, inference_engine_client) -> None:
         """Initialize weight sync state for policy model."""
-        ray.get(
+        deadline.ray_get(
             self._actor_groups["policy"].async_run_ray_method(
                 "pass_through",
                 "init_weight_sync_state",
                 inference_engine_client,
                 self.cfg.generator.inference_engine,
-            )
+            ),
+            "init_weight_sync_state",
         )
 
     def _broadcast_to_inference_engines(self, inference_engine_client, model_id: Optional[str] = None) -> None:
@@ -487,31 +798,114 @@ class WorkerDispatch:
         registered on vLLM under that name. None preserves single-tenant
         behavior (the legacy ``SKYRL_LORA_ADAPTER_NAME`` path).
         """
-        ray.get(
+        # Pass None for the client: workers cached it at init_weight_sync_state.
+        # It carries the HF tokenizer (~10MB — 0.13s pickle driver-side, 0.34s
+        # unpickle on EVERY worker), so shipping it per sync costs ~0.5s of the
+        # sync wall even via ray.put (deref still deserializes per worker).
+        deadline.ray_get(
             self._actor_groups["policy"].async_run_ray_method(
                 "pass_through",
                 "broadcast_to_inference_engines",
-                inference_engine_client,
+                None,
                 self.cfg.generator.inference_engine,
                 model_id=model_id,
-            )
+            ),
+            "broadcast_to_inference_engines",
         )
 
-    def _prepare_for_weight_sync(self) -> None:
-        """Prepare for weight sync: ensure policy model is on GPU, offload optimizer. Helper for save_weights_for_sampler."""
-        if not self.colocate_all:
-            return
-        # Ensure policy model is on GPU (will offload others in colocation group)
-        self._ensure_on_gpu("policy", need_optimizer=False, need_model=True)
-        # Offload optimizer if it's on GPU
-        if self._gpu_state["policy"].optimizer_on_gpu:
-            self._offload("policy", offload_optimizer=True, offload_model=False)
+    def get_timing_metrics(self) -> Dict[str, float]:
+        """Timing this dispatch measured itself, to merge into the trainer's metrics.
 
-    def _finish_weight_sync(self) -> None:
-        """Finish weight sync: offload model weights and optimizer state. Helper for save_weights_for_sampler."""
+        ``sync_weights_only_transfer`` is the weight transfer alone, reported apart
+        from the trainer's ``sync_weights``, which also brackets the generation
+        pause/resume (seconds of coordinator quiesce under vLLM DP). Empty until the
+        first sync.
+        """
+        if self.last_weight_sync_seconds is None:
+            return {}
+        return {"sync_weights_only_transfer": self.last_weight_sync_seconds}
+
+    async def _prepare_for_weight_sync(self, adapter_only_sync: bool = False) -> None:
+        """Prepare colocated trainer/engine residency for sampler weight sync."""
         if not self.colocate_all:
             return
-        self._offload("policy", offload_optimizer=True, offload_model=True)
+
+        if adapter_only_sync:
+            for model, state in self._gpu_state.items():
+                if state.model_on_gpu or state.optimizer_on_gpu:
+                    self._offload(model, offload_optimizer=True, offload_model=True)
+            self.empty_cache("policy")
+            return
+
+        # Engines that hold frozen requests already freed the GPU memory. `sleep()` would abort
+        # those requests, so do not call it for them.
+        if not self._engines_hold_frozen_requests():
+            is_sleeping = await self._inference_engine_client.is_sleeping()
+            if not is_sleeping:
+                await self._inference_engine_client.sleep()
+
+        offload_optimizer = self.cfg.trainer.policy.optimizer_config.offload_after_step
+        self._ensure_on_gpu(
+            "policy",
+            need_optimizer=False,
+            need_model=True,
+        )
+        if offload_optimizer and self._gpu_state["policy"].optimizer_on_gpu:
+            self._offload("policy", offload_optimizer=True, offload_model=False)
+        # Release cached allocator blocks before the engines wake their
+        # weights: a preceding forward/optim step can leave tens of GB of
+        # freed-but-cached CUDA blocks in the trainer processes, and for
+        # TB-scale models (trainer masters + vLLM weights near the GPU
+        # capacity) that hoard is the difference between the colocated
+        # wake_up(tags=["weights"]) fitting and OOMing.
+        self.empty_cache("policy")
+
+    def _finish_weight_sync(self, adapter_only_sync: bool = False) -> None:
+        """Offload policy weights and conditionally offload optimizer state."""
+        if not self.colocate_all or adapter_only_sync:
+            return
+        self._offload(
+            "policy",
+            offload_optimizer=self.cfg.trainer.policy.optimizer_config.offload_after_step,
+            offload_model=True,
+        )
+
+    def _engines_hold_frozen_requests(self) -> bool:
+        """True while the colocated inference engines sleep with paused requests.
+
+        See ``RemoteInferenceClient.sleep_with_frozen_requests``. Other client classes do not have
+        the attribute. The comparison with ``True`` keeps a mock client, whose attributes are all
+        truthy, on the default path."""
+        return self.colocate_all and getattr(self._inference_engine_client, "requests_frozen_asleep", False) is True
+
+    def _assert_frozen_requests_have_a_kv_cache_source(self) -> None:
+        """Reject a weight sync that would resume frozen requests on an empty KV cache.
+
+        ``sleep_with_frozen_requests(offload_kv=False)`` discards the KV cache. The paused requests
+        are then correct only when the weight sync resets the prefix cache, so that the inference
+        engine prefills them again. The condition is the one of ``Worker._should_reset_prefix_cache``.
+        The comparison with ``False`` keeps a mock client on the default path."""
+        if getattr(self._inference_engine_client, "frozen_kv_offloaded", True) is not False:
+            return
+        fully_async_cfg = self.cfg.trainer.fully_async
+        resets_prefix_cache = self.cfg.generator.inference_engine.enable_prefix_caching and (
+            not fully_async_cfg.enabled or fully_async_cfg.clear_kv_cache_on_weight_sync
+        )
+        assert resets_prefix_cache, (
+            "The inference engines sleep with frozen requests and discarded the KV cache "
+            "(offload_kv=False), but this weight sync does not reset the prefix cache. The paused requests "
+            "would continue on an empty KV cache. Set trainer.fully_async.clear_kv_cache_on_weight_sync=true "
+            "with generator.inference_engine.enable_prefix_caching=true, or sleep with offload_kv=True."
+        )
+
+    def _is_lora_no_merge(self) -> bool:
+        """True for the megatron LoRA path that ships standalone adapters to vLLM."""
+        policy_cfg = self.cfg.trainer.policy
+        return (
+            self.cfg.trainer.strategy == "megatron"
+            and policy_cfg.model.lora.rank > 0
+            and not policy_cfg.megatron_config.lora_config.merge_lora
+        )
 
     async def save_weights_for_sampler(self, model_id: Optional[str] = None) -> None:
         """
@@ -521,6 +915,7 @@ class WorkerDispatch:
         provided we ensure the corresponding LoRA adapter is the live one
         before broadcasting, and tell the worker to register the adapter on
         vLLM under ``model_id``.
+
         """
         if self._inference_engine_client is None:
             raise RuntimeError(
@@ -528,15 +923,60 @@ class WorkerDispatch:
                 "Pass inference_engine_client to WorkerDispatch constructor or call set_inference_engine_client()."
             )
 
+        adapter_only_sync = self.colocate_all and self._is_lora_no_merge()
+
+        def _transfer() -> None:
+            self._broadcast_to_inference_engines(self._inference_engine_client, model_id=model_id)
+            self._finish_weight_sync(adapter_only_sync=adapter_only_sync)
+
+        async def _broadcast_and_finish() -> None:
+            """The weight transfer proper, timed on its own.
+
+            The transfer blocks on ``ray.get`` for the whole broadcast, so it runs in a
+            worker thread: on the event loop it would stall every coroutine sharing the
+            loop (the fully-async generators) and expire their timeouts. A cancellation
+            waits for the transfer to finish before propagating (chained to the transfer's
+            error, if any), so the enclosing resume bracket never resumes generation onto
+            partially transferred weights.
+
+            ``last_weight_sync_seconds`` is surfaced as
+            ``timing/sync_weights_only_transfer`` via :meth:`get_timing_metrics`,
+            alongside the trainer's own ``sync_weights`` timer, which wraps the
+            enclosing pause/resume bracket too.
+            """
+            start = time.perf_counter()
+            with deadline.operation("broadcast_to_inference_engines"):
+                transfer = asyncio.ensure_future(asyncio.to_thread(_transfer))
+                cancelled = False
+                while not transfer.done():
+                    try:
+                        await asyncio.wait({transfer})
+                    except asyncio.CancelledError:
+                        cancelled = True
+                if cancelled:
+                    raise asyncio.CancelledError() from transfer.exception()
+                transfer.result()
+            self.last_weight_sync_seconds = time.perf_counter() - start
+
         # Sync weights to inference engine
-        self._prepare_for_weight_sync()
+        await self._prepare_for_weight_sync(adapter_only_sync=adapter_only_sync)
         # Make the requested adapter live on every worker before broadcasting
         # — otherwise we'd export some other tenant's LoRA weights to vLLM.
-        self.ensure_active_adapter("policy", model_id)
-        if self.colocate_all:
+        self.ensure_active_adapter("policy", model_id, require_model_resident=not adapter_only_sync)
+        if self._engines_hold_frozen_requests():
+            # The partial-rollout trainer froze the in-flight requests and slept the allocator
+            # (`sleep_with_frozen_requests`). Wake the allocator directly, so the scheduler stays
+            # paused until the KV cache is back. If the transfer fails, keep the engines asleep and
+            # the requests paused: the trainer model is still on the shared GPUs, and the error
+            # ends the run.
+            self._assert_frozen_requests_have_a_kv_cache_source()
+            await self._inference_engine_client.wake_for_weight_sync(tags=["weights"])
+            await _broadcast_and_finish()
+            await self._inference_engine_client.wake_for_weight_sync(tags=["kv_cache"])
+            await self._inference_engine_client.resume_generation()
+        elif self.colocate_all:
             await self._inference_engine_client.wake_up(tags=["weights"])
-            self._broadcast_to_inference_engines(self._inference_engine_client, model_id=model_id)
-            self._finish_weight_sync()
+            await _broadcast_and_finish()
             await self._inference_engine_client.wake_up(tags=["kv_cache"])
         else:
             strategy = self.cfg.trainer.strategy
@@ -544,15 +984,71 @@ class WorkerDispatch:
             if is_lora and not (
                 strategy == "megatron" and self.cfg.trainer.policy.megatron_config.lora_config.merge_lora
             ):
-                # in-place lora case (mostly for multi-tenant training) - no need to pause - can just rely on load_lora_adapter to swap adapter in place
-                self._broadcast_to_inference_engines(self._inference_engine_client, model_id=model_id)
-                self._finish_weight_sync()
+                if self.cfg.generator.inference_engine.data_parallel_size > 1:
+                    # Under data parallelism the DP ranks step in lockstep; pause first so every rank is idle.
+                    # - memory sync: the update is a collective RPC on every vLLM worker. A rank that enters the
+                    #   weight receive stops stepping, and a rank still in a generation step then blocks in the DP
+                    #   all-reduce forever (and the sync never completes).
+                    # - disk sync: each DP rank swaps the adapter whenever its own load_lora_adapter lands, so with
+                    #   expert parallelism a single forward can mix old and new adapter weights across ranks.
+                    # TODO: this pauses every adapter's generation on each tenant's sync; consider an engine-side
+                    # swap at a common DP step instead of a global pause.
+                    await self._inference_engine_client.pause_generation()
+                    async with cleanup_preserving_primary(
+                        self._inference_engine_client.resume_generation, "resume_generation"
+                    ):
+                        await _broadcast_and_finish()
+                else:
+                    # in-place lora case (mostly for multi-tenant training) on a single DP rank - no need to pause -
+                    # can just rely on load_lora_adapter to swap adapter in place
+                    await _broadcast_and_finish()
+            elif self.cfg.generator.inference_engine.offload_kv_for_weight_sync:
+                # Sleep the engine to free GPU memory during the sync (wake weights,
+                # broadcast, wake KV cache) so gpu_memory_utilization can run higher.
+                if self.cfg.trainer.fully_async.enabled:
+                    # Generation overlaps the sync: KEEP-pause to freeze in-flight
+                    # requests, then drive the allocator directly so the scheduler is
+                    # not resumed on the weights wake. Offload the KV cache to CPU to
+                    # resume frozen requests without recompute, unless the sync will
+                    # reset the prefix cache anyway (clear_kv_cache_on_weight_sync).
+                    offload_kv = not self.cfg.trainer.fully_async.clear_kv_cache_on_weight_sync
+                    await self._inference_engine_client.pause_generation()
+                    async with cleanup_preserving_primary(
+                        self._inference_engine_client.resume_generation, "resume_generation"
+                    ):
+                        await self._inference_engine_client.sleep_for_weight_sync(offload_kv=offload_kv)
+                        # Wake the KV cache even if the sync fails, so the resume above never
+                        # schedules the frozen requests onto a sleeping KV cache.
+                        async with cleanup_preserving_primary(
+                            lambda: self._inference_engine_client.wake_for_weight_sync(tags=["kv_cache"]),
+                            "wake_for_weight_sync(kv_cache)",
+                        ):
+                            await self._inference_engine_client.wake_for_weight_sync(tags=["weights"])
+                            await _broadcast_and_finish()
+                else:
+                    # Synchronous trainer: generation is complete at sync time, so there
+                    # are no in-flight requests to preserve. A plain sleep (discards KV,
+                    # aborts nothing) is enough -- same three-phase pattern as colocated.
+                    await self._inference_engine_client.sleep()
+                    async with cleanup_preserving_primary(
+                        lambda: self._inference_engine_client.wake_up(tags=["kv_cache"]), "wake_up(kv_cache)"
+                    ):
+                        await self._inference_engine_client.wake_up(tags=["weights"])
+                        await _broadcast_and_finish()
             else:
                 # Non-colocated single tenant: pause generation to prevent in-flight requests from
                 # reading partially-updated weights during the NCCL broadcast.
-                await self._inference_engine_client.pause_generation()
-                try:
-                    self._broadcast_to_inference_engines(self._inference_engine_client, model_id=model_id)
-                    self._finish_weight_sync()
-                finally:
-                    await self._inference_engine_client.resume_generation()
+                if self.cfg.generator.inference_engine.weight_sync_backend == "delta":
+                    # Delta disk sync performs publish/fetch before pausing and
+                    # pauses internally only around the final reload.
+                    await _broadcast_and_finish()
+                else:
+                    await self._inference_engine_client.pause_generation()
+                    async with cleanup_preserving_primary(
+                        self._inference_engine_client.resume_generation, "resume_generation"
+                    ):
+                        await _broadcast_and_finish()
+
+        # Advance the policy version so prefix-cache salting isolates blocks from the previous weights
+        # (see `GeneratorConfig.use_cache_salt`).
+        self._inference_engine_client.increment_weight_version()

@@ -28,7 +28,14 @@ from jaxtyping import Float
 from loguru import logger
 
 from skyrl.backends.skyrl_train.utils.off_policy_correction_utils import (
+    DPPOTrustRegion,
+    DPPOType,
+    MemberWeight,
+    RatioBand,
+    RatioClamp,
+    UnitWeight,
     apply_off_policy_correction,
+    sampler_ratio,
 )
 from skyrl.backends.skyrl_train.utils.torch_utils import masked_mean, safe_exp_delta
 from skyrl.train.config import AlgorithmConfig
@@ -98,7 +105,8 @@ def compute_approx_kl(
     Args:
         log_probs: Log probabilities of the new distribution.
         log_probs_base: Log probabilities of the base distribution.
-        action_mask: Mask for actions.
+        loss_mask: Optional mask over trainable response tokens.
+        kl_estimator_type: One of ``k1``, ``abs``, ``k2``, or ``k3``.
     """
     if kl_estimator_type == "k1":
         kld = log_probs - log_probs_base
@@ -453,6 +461,27 @@ class PolicyLossType(StrEnum):
     SAPO = "sapo"
     CROSS_ENTROPY = "cross_entropy"
     IMPORTANCE_SAMPLING = "importance_sampling"
+    DPPO = "dppo"
+    REINFORCE = "reinforce"
+
+
+# Losses that optimize against rollout logprobs (or none), so the "old" logprobs forward pass can be
+# skipped when nothing else needs them (see `RayPPOTrainer._skip_policy_forward`).
+LOSSES_WITHOUT_OLD_LOGPROBS = frozenset({PolicyLossType.ROLLOUT_IS, PolicyLossType.DPPO, PolicyLossType.REINFORCE})
+
+LOSSES_WITH_OLD_LOGPROBS = frozenset(
+    {
+        PolicyLossType.REGULAR,
+        PolicyLossType.DUAL_CLIP,
+        PolicyLossType.GSPO,
+        PolicyLossType.CISPO,
+        PolicyLossType.CLIP_COV,
+        PolicyLossType.KL_COV,
+        PolicyLossType.SAPO,
+        PolicyLossType.CROSS_ENTROPY,
+        PolicyLossType.IMPORTANCE_SAMPLING,
+    }
+)
 
 
 class PolicyLossRegistry(BaseFunctionRegistry):
@@ -479,12 +508,15 @@ class PolicyLossRegistry(BaseFunctionRegistry):
             "regular": [PolicyLossType.REGULAR, ppo_policy_loss],
             "dual_clip": [PolicyLossType.DUAL_CLIP, ppo_policy_loss],
             "gspo": [PolicyLossType.GSPO, gspo_policy_loss],
+            "cispo": [PolicyLossType.CISPO, compute_policy_loss_cispo],
             "clip_cov": [PolicyLossType.CLIP_COV, compute_policy_loss_clip_cov],
             "kl_cov": [PolicyLossType.KL_COV, compute_policy_loss_kl_cov],
             "sapo": [PolicyLossType.SAPO, sapo_policy_loss],
             "cross_entropy": [PolicyLossType.CROSS_ENTROPY, cross_entropy_loss],
             "importance_sampling": [PolicyLossType.IMPORTANCE_SAMPLING, importance_sampling_loss],
+            "dppo": [PolicyLossType.DPPO, dppo_policy_loss],
             "rollout_is": [PolicyLossType.ROLLOUT_IS, rollout_is_policy_loss],
+            "reinforce": [PolicyLossType.REINFORCE, reinforce_policy_loss],
         }
 
         for pl_name, (pl_type, pl_func) in pl_types.items():
@@ -714,6 +746,7 @@ def compute_policy_loss_cispo(
     config: AlgorithmConfig,
     loss_mask: Optional[torch.Tensor] = None,
     rollout_logprobs: Optional[torch.Tensor] = None,
+    score_centering_term: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, dict[str, float]]:
     """Implementation of CISPO (Clipped IS-weight Policy Optimization) loss function,
     as proposed in https://arxiv.org/abs/2506.13585.
@@ -723,16 +756,80 @@ def compute_policy_loss_cispo(
     update. This means the model can still learn from samples whose importance sampling
     ratio is clipped in CISPO, as opposed to PPO where these samples have zero
     gradient and are essentially ignored.
-    """
-    ratio = safe_exp_delta(log_probs - old_log_probs, clip=20.0, out_dtype=log_probs.dtype)
-    clamped_ratio = torch.clamp(ratio, 1 - config.cispo.cispo_eps_clip_low, 1 + config.cispo.cispo_eps_clip_high)
-    loss = -advantages * clamped_ratio.detach() * log_probs
 
-    is_clipped = (ratio < 1 - config.cispo.cispo_eps_clip_low) | (ratio > 1 + config.cispo.cispo_eps_clip_high)
+    The behavior policy the IS ratio is anchored on is selected by ``config.cispo.cispo_anchor``:
+
+    * ``"old"`` (default, original CISPO): ``ratio = pi_theta / pi_old``, where ``pi_old`` is the
+      recomputed log-probs of the current policy at experience-prep. Under a single gradient step
+      this ratio is ~1, so the clamp only bites across multiple gradient passes over a frozen batch.
+    * ``"rollout"``: ``ratio = pi_theta / pi_rollout``, anchored on the sampler/behavior policy. This
+      makes the clamped objective engage under fully-async training, where the sampler lags the
+      trainer by up to ``max_staleness_steps`` so the ratio genuinely differs from 1 even at a single
+      gradient pass. Here the rollout-anchored ratio *is* the off-policy correction, so stacking TIS
+      (``off_policy_correction.tis_ratio_type``) would double-count it and is rejected.
+
+    The ``"rollout"`` anchor is the clamped (CISPO) counterpart of the hard-zero ``rollout_is`` loss:
+    both anchor on ``pi_rollout``, but CISPO caps out-of-range tokens rather than zeroing them, so
+    every token keeps a (bounded) gradient.
+
+    Logs ``clip_ratio`` (cap-hit fraction) plus ``cispo/ratio_{mean,clamped_mean,max,min}`` so the
+    actual gradient multiplier ``r = pi_theta / pi_behavior`` is observable, not just how often the
+    cap fires (which is near-zero with a wide ``eps_clip_high``).
+
+    ``score_centering_term`` (``cispo_anchor="rollout"`` only) is the per-token
+    ``Σ_v sg[q_v clamp(r_v)] log π_v`` over the recorded support; see ``score_centering_weight``.
+    """
+    anchor = config.cispo.cispo_anchor
+    if score_centering_term is not None and anchor != "rollout":
+        raise ValueError("score centering requires cispo_anchor='rollout'")
+    if anchor == "rollout":
+        assert rollout_logprobs is not None, "rollout_logprobs are required for cispo with cispo_anchor='rollout'"
+        if config.off_policy_correction.tis_ratio_type is not None:
+            raise ValueError(
+                "cispo_anchor='rollout' is already rollout-anchored and performs the off-policy "
+                f"correction; TIS (tis_ratio_type={config.off_policy_correction.tis_ratio_type!r}) "
+                "would double-count it. Set off_policy_correction.tis_ratio_type=None."
+            )
+        behavior_log_probs = rollout_logprobs
+    else:
+        behavior_log_probs = old_log_probs
+
+    clamp = RatioClamp.from_clip(config.cispo.cispo_eps_clip_low, config.cispo.cispo_eps_clip_high)
+    ratio = sampler_ratio(log_probs - behavior_log_probs, out_dtype=log_probs.dtype)
+    clamped_ratio = clamp.calibrate(ratio)
+    loss = -advantages * clamped_ratio.detach() * log_probs
+    if score_centering_term is not None:
+        loss = loss + advantages * score_centering_term
+
+    is_clipped = clamp.clipped(ratio)
     clip_ratio = masked_mean(is_clipped.float(), loss_mask).mean().detach().item()
 
+    # IS-ratio diagnostics. clip_ratio above is only the cap-HIT fraction; these expose the actual
+    # gradient multiplier r = pi_theta / pi_behavior. Under cispo_anchor="rollout", r drifts from 1
+    # via the vLLM-vs-train numerical gap + async staleness even at a single gradient pass, so mean(r)
+    # and the raw-vs-clamped gap quantify how much the off-policy correction (and the cap) actually
+    # move the gradient -- not just how often the cap fires. For max/min we select only the active
+    # (unmasked) ratios: `ratio` is strictly positive (safe_exp_delta), so multiplying by loss_mask
+    # would zero masked tokens and force min to 0.0 whenever any token is masked. masked_mean excludes
+    # them for the means.
+    cispo_ratio_mean = masked_mean(ratio, loss_mask).mean().detach().item()
+    cispo_ratio_clamped_mean = masked_mean(clamped_ratio, loss_mask).mean().detach().item()
+    if loss_mask is not None and loss_mask.any():
+        active_ratio = ratio[loss_mask.bool()]
+        cispo_ratio_max = active_ratio.max().detach().item()
+        cispo_ratio_min = active_ratio.min().detach().item()
+    else:
+        cispo_ratio_max = ratio.max().detach().item()
+        cispo_ratio_min = ratio.min().detach().item()
+
     # apply off policy correction
-    loss_metrics = {"clip_ratio": clip_ratio}
+    loss_metrics = {
+        "clip_ratio": clip_ratio,
+        "cispo/ratio_mean": cispo_ratio_mean,
+        "cispo/ratio_clamped_mean": cispo_ratio_clamped_mean,
+        "cispo/ratio_max": cispo_ratio_max,
+        "cispo/ratio_min": cispo_ratio_min,
+    }
     loss, loss_mask, off_policy_metrics = apply_off_policy_correction(
         loss, old_log_probs, rollout_logprobs, loss_mask, config.off_policy_correction
     )
@@ -740,6 +837,31 @@ def compute_policy_loss_cispo(
 
     loss = reduce_loss(loss, loss_mask)
     return loss, loss_metrics
+
+
+def score_centering_weight(loss_name: str, loss_config: AlgorithmConfig) -> MemberWeight:
+    """The weight ``f`` a loss gives the sampled token's score, which score centering applies to
+    every support member (https://arxiv.org/abs/2609.20807, App. A.2).
+
+    Only losses whose weight is relative to the sampler qualify; one relative to ``π_old`` (PPO's
+    ratio) is computed by the trainer itself and never sees the training-inference mismatch.
+    ``loss_config`` must be the post-override config the loss itself receives, so both sides use
+    the same weight.
+    """
+    if loss_name == PolicyLossType.REINFORCE:
+        return UnitWeight()
+    if loss_name == PolicyLossType.ROLLOUT_IS:
+        return RatioBand.from_clip(loss_config.eps_clip_low, loss_config.eps_clip_high)
+    if loss_name == PolicyLossType.CISPO and loss_config.cispo.cispo_anchor == "rollout":
+        return RatioClamp.from_clip(loss_config.cispo.cispo_eps_clip_low, loss_config.cispo.cispo_eps_clip_high)
+    if loss_name == PolicyLossType.DPPO:
+        dppo = loss_config.dppo
+        return DPPOTrustRegion(DPPOType(dppo.dppo_type), delta_low=dppo.delta_low, delta_high=dppo.delta_high)
+    raise ValueError(
+        f"score centering needs a loss weighted relative to the sampler: {PolicyLossType.REINFORCE.value!r}, "
+        f"{PolicyLossType.ROLLOUT_IS.value!r}, {PolicyLossType.CISPO.value!r} with cispo_anchor='rollout', or "
+        f"{PolicyLossType.DPPO.value!r}; got {loss_name!r}"
+    )
 
 
 @register_policy_loss(PolicyLossType.ROLLOUT_IS)
@@ -750,6 +872,7 @@ def rollout_is_policy_loss(
     config: AlgorithmConfig,
     loss_mask: Optional[torch.Tensor] = None,
     rollout_logprobs: Optional[torch.Tensor] = None,
+    score_centering_term: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, dict[str, float]]:
     """Calibrated importance-weighted policy gradient using rollout log-probs.
 
@@ -763,18 +886,113 @@ def rollout_is_policy_loss(
     old_log_probs are not available.
     It further uses hard zero instead of clamping, but that does not change
     the gradient only the loss value.
+
+    ``score_centering_term`` is the per-token ``Σ_v sg[q_v f(r_v)] log π_θ(v)`` over the recorded
+    support; see ``score_centering_weight``.
     """
     assert rollout_logprobs is not None, "rollout_logprobs are required for rollout_is"
 
-    ratio = safe_exp_delta(log_probs - rollout_logprobs, clip=20.0, out_dtype=log_probs.dtype)
-
-    in_range = (ratio > 1 - config.eps_clip_low) & (ratio < 1 + config.eps_clip_high)
-    calibrated_ratio = torch.where(in_range, ratio, torch.zeros_like(ratio))
+    band = RatioBand.from_clip(config.eps_clip_low, config.eps_clip_high)
+    ratio = sampler_ratio(log_probs - rollout_logprobs, out_dtype=log_probs.dtype)
+    in_range = band.contains(ratio)
+    calibrated_ratio = band.calibrate(ratio)
 
     loss = -(calibrated_ratio.detach() * advantages * log_probs)
+    if score_centering_term is not None:
+        loss = loss + advantages * score_centering_term
     clip_ratio = masked_mean((~in_range).float(), loss_mask).mean().detach().item()
 
     loss_metrics: dict[str, float] = {"clip_ratio": clip_ratio}
+    loss, loss_mask, off_policy_metrics = apply_off_policy_correction(
+        loss, old_log_probs, rollout_logprobs, loss_mask, config.off_policy_correction
+    )
+    loss_metrics.update(off_policy_metrics)
+
+    loss = reduce_loss(loss, loss_mask)
+    return loss, loss_metrics
+
+
+@register_policy_loss(PolicyLossType.REINFORCE)
+def reinforce_policy_loss(
+    log_probs: torch.Tensor,
+    old_log_probs: torch.Tensor,
+    advantages: torch.Tensor,
+    config: AlgorithmConfig,
+    loss_mask: Optional[torch.Tensor] = None,
+    rollout_logprobs: Optional[torch.Tensor] = None,
+    score_centering_term: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, dict[str, float]]:
+    """Plain policy gradient on the sampled tokens, with no importance ratio.
+
+    L(θ) = -E_t[ Â_t · log π_θ(a_t|s_t) ]
+
+    Under a training-inference mismatch this carries the full drift
+    (https://arxiv.org/abs/2609.20807); ``score_centering_term``, the per-token
+    ``Σ_v sg[q_v] log π_θ(v)`` over the recorded support, cancels it.
+    """
+    loss = -(advantages * log_probs)
+    if score_centering_term is not None:
+        loss = loss + advantages * score_centering_term
+
+    loss_metrics: dict[str, float] = {"clip_ratio": 0.0}
+    loss, loss_mask, off_policy_metrics = apply_off_policy_correction(
+        loss, old_log_probs, rollout_logprobs, loss_mask, config.off_policy_correction
+    )
+    loss_metrics.update(off_policy_metrics)
+
+    loss = reduce_loss(loss, loss_mask)
+    return loss, loss_metrics
+
+
+@register_policy_loss(PolicyLossType.DPPO)
+def dppo_policy_loss(
+    log_probs: torch.Tensor,
+    old_log_probs: torch.Tensor,
+    advantages: torch.Tensor,
+    config: AlgorithmConfig,
+    loss_mask: Optional[torch.Tensor] = None,
+    rollout_logprobs: Optional[torch.Tensor] = None,
+    score_centering_term: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, dict[str, float]]:
+    """
+    Divergence Proximal Policy Optimization (DPPO) policy loss.
+
+    Replaces PPO's ratio-based clipping with a divergence-based binary mask.
+    Supports Binary-TV and Binary-KL variants.
+    The paper also proposes Top-K TV/KL variants (Equations 15-16), but in
+    Section G.2 the authors find Top-K masking provides no significant benefit
+    over the simpler binary approximation, so we only implement binary here.
+
+    See: https://arxiv.org/abs/2602.04879
+    Reference impl: https://github.com/sail-sg/Stable-RL/blob/main/verl/trainer/ppo/core_algos.py#L1241
+
+    ``score_centering_term`` is the per-token ``Σ_v sg[q_v f(r_v)] log π_θ(v)`` over the recorded
+    support, for the advantage's sign; see ``score_centering_weight``.
+    """
+    # Use rollout logprobs as behavior policy for both ratio and mask
+    # See Section 5.2 of paper
+    mu_log_probs = rollout_logprobs if rollout_logprobs is not None else old_log_probs
+    ratio = sampler_ratio(log_probs - mu_log_probs, out_dtype=log_probs.dtype)
+
+    trust_region = DPPOTrustRegion(
+        DPPOType(config.dppo.dppo_type), delta_low=config.dppo.delta_low, delta_high=config.dppo.delta_high
+    )
+    with torch.no_grad():
+        trainer_log_probs = log_probs.detach()
+        keep_positive = trust_region.keep(trainer_log_probs, mu_log_probs, negative_advantage=False)
+        keep_negative = trust_region.keep(trainer_log_probs, mu_log_probs, negative_advantage=True)
+        keep = torch.where(advantages > 0, keep_positive, torch.where(advantages < 0, keep_negative, True))
+        mask = keep.to(advantages.dtype)
+
+    # Surrogate loss with divergence-based mask
+    loss = -(ratio * advantages * mask)
+    if score_centering_term is not None:
+        loss = loss + advantages * score_centering_term
+
+    clip_ratio = masked_mean((mask == 0).float(), loss_mask).mean().detach().item()
+    loss_metrics = {"clip_ratio": clip_ratio}
+
+    # Apply off-policy correction
     loss, loss_mask, off_policy_metrics = apply_off_policy_correction(
         loss, old_log_probs, rollout_logprobs, loss_mask, config.off_policy_correction
     )
@@ -1004,6 +1222,7 @@ def apply_loss_reduction_to_advantages_minibatch(
     loss_reduction: str,
     micro_batch_size: int,
     max_seq_len: int,
+    prompt_boundaries: Optional[List[Tuple[int, int]]] = None,
 ) -> torch.Tensor:
     """Scale advantages so that summing produces the desired loss reduction.
 
@@ -1011,9 +1230,12 @@ def apply_loss_reduction_to_advantages_minibatch(
         advantages: Advantage tensor of shape (minibatch_size, seq_len).
             For step-wise training, minibatch_size can be variable.
         loss_mask: Mask of shape (minibatch_size, seq_len) indicating valid loss tokens.
-        loss_reduction: One of "token_mean", "token_mean_legacy", "sequence_mean", "seq_mean_token_sum_norm".
+        loss_reduction: One of "token_mean", "token_mean_legacy", "sequence_mean",
+            "seq_mean_token_sum_norm", "prompt_mean".
         micro_batch_size: Number of sequences per micro-batch
         max_seq_len: Maximum sequence length.
+        prompt_boundaries: Mini-batch-relative (start, end) slices grouping the sequences of
+            each prompt. Required for "prompt_mean"; ignored otherwise.
 
     Returns:
         Scaled advantages tensor.
@@ -1047,6 +1269,18 @@ def apply_loss_reduction_to_advantages_minibatch(
     elif loss_reduction == "seq_mean_token_sum_norm":
         normalized_advantages = advantages / (batch_size * max_seq_len)
 
+    # Option 4: Prompt level mean - token mean within each prompt, then average over all prompts.
+    # A "prompt" is a group of sequences sharing the same prompt (e.g. the n_samples_per_prompt
+    # GRPO responses). Scale token [i, t] in prompt p by 1 / (num_prompts * tokens_in_prompt_p)
+    # so that summing the per-token policy loss yields mean_p(token_mean within prompt p).
+    elif loss_reduction == "prompt_mean":
+        if prompt_boundaries is None:
+            raise ValueError("`prompt_mean` loss reduction requires `prompt_boundaries`")
+        num_prompts = len(prompt_boundaries)
+        for p_start, p_end in prompt_boundaries:
+            prompt_tokens = loss_mask[p_start:p_end].sum().clamp(min=1)
+            normalized_advantages[p_start:p_end] = advantages[p_start:p_end] / (num_prompts * prompt_tokens)
+
     else:
         raise ValueError(f"Invalid loss reduction type: {loss_reduction}")
 
@@ -1066,12 +1300,12 @@ def compute_reinforce_plus_plus_outcome_advantage(
     This implementation is based on the paper: https://arxiv.org/abs/2501.03262
 
     Args:
-        - token_level_rewards: Float[torch.Tensor, "batch_size seqlen"]
-        - response_mask: Float[torch.Tensor, "batch_size seqlen"]
+        - token_level_rewards: Float[torch.Tensor, "batch_size response_len"]
+        - response_mask: Float[torch.Tensor, "batch_size response_len"]
 
     Returns:
-        - advantages: Float[torch.Tensor, "batch_size seqlen"]
-        - returns: Float[torch.Tensor, "batch_size seqlen"]
+        - advantages: Float[torch.Tensor, "batch_size response_len"]
+        - returns: Float[torch.Tensor, "batch_size response_len"]
     """
     with torch.no_grad():
         returns = torch.zeros_like(token_level_rewards)
@@ -1104,13 +1338,13 @@ def compute_rloo_outcome_advantage(
     (https://openreview.net/pdf?id=r1lgTGL5DE).
 
     Args:
-        - token_level_rewards: Float[torch.Tensor, "batch_size seqlen"]
-        - response_mask: Float[torch.Tensor, "batch_size seqlen"]
+        - token_level_rewards: Float[torch.Tensor, "batch_size response_len"]
+        - response_mask: Float[torch.Tensor, "batch_size response_len"]
         - index: np.ndarray (batch_size)
 
     Returns:
-        - advantages: Float[torch.Tensor, "batch_size seqlen"]
-        - returns: Float[torch.Tensor, "batch_size seqlen"]
+        - advantages: Float[torch.Tensor, "batch_size response_len"]
+        - returns: Float[torch.Tensor, "batch_size response_len"]
     """
     from loguru import logger as logger_
 
@@ -1144,13 +1378,13 @@ def compute_rloo_outcome_advantage(
 
 @register_advantage_estimator(AdvantageEstimator.GAE)
 def compute_gae_advantage_return(
-    token_level_rewards: Float[torch.Tensor, "batch_size seqlen"],
-    values: Float[torch.Tensor, "batch_size seqlen"],
-    response_mask: Float[torch.Tensor, "batch_size seqlen"],
+    token_level_rewards: Float[torch.Tensor, "batch_size response_len"],
+    values: Float[torch.Tensor, "batch_size response_len"],
+    response_mask: Float[torch.Tensor, "batch_size response_len"],
     gamma: float,
     lambd: float,
     **kwargs,
-) -> Tuple[Float[torch.Tensor, "batch_size seqlen"], Float[torch.Tensor, "batch_size seqlen"]]:
+) -> Tuple[Float[torch.Tensor, "batch_size response_len"], Float[torch.Tensor, "batch_size response_len"]]:
     """
     Compute advantage and return for GAE.
 
@@ -1186,15 +1420,15 @@ def compute_grpo_outcome_advantage(
     Compute advantage for GRPO, operating only on Outcome reward (with only one scalar reward for each response).
 
     Expects:
-        - token_level_rewards: Float[torch.Tensor, "batch_size seqlen"]
-        - response_mask: Float[torch.Tensor, "batch_size seqlen"]
+        - token_level_rewards: Float[torch.Tensor, "batch_size response_len"]
+        - response_mask: Float[torch.Tensor, "batch_size response_len"]
         - index: np.ndarray (batch_size)
         - epsilon: float
         - grpo_norm_by_std: bool
 
     Returns:
-        - advantages: Float[torch.Tensor, "batch_size seqlen"]
-        - returns: Float[torch.Tensor, "batch_size seqlen"]
+        - advantages: Float[torch.Tensor, "batch_size response_len"]
+        - returns: Float[torch.Tensor, "batch_size response_len"]
     """
     # this assumes response-level rewards
     scores = token_level_rewards.sum(dim=-1)

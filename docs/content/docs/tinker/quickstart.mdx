@@ -8,7 +8,7 @@ If you run into any issues, please [open an issue](https://github.com/NovaSky-AI
 
 ## Prerequisites
 
-- CUDA 12.8
+- CUDA 13.0 (NVIDIA driver r580 or newer)
 - [uv](https://docs.astral.sh/uv/) package manager
 
 ## 1. Clone and Install SkyRL
@@ -26,7 +26,7 @@ The server hosts the Tinker API and manages a background engine that processes t
 
 ```bash
 uv run --extra tinker --extra fsdp -m skyrl.tinker.api \
-    --base-model "Qwen/Qwen3-0.6B" \
+    --base-model "Qwen/Qwen3-4B-Instruct-2507" \
     --backend fsdp
 ```
 
@@ -42,6 +42,8 @@ The server is ready when you see `Uvicorn running on http://0.0.0.0:8000`.
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--base-model` | (required) | HuggingFace model name or path |
+| `--base-model-checkpoint-path` | unset | Compatible base-weight directory to load instead of `--base-model` |
+| `--runtime-role` | `combined` | Allocate the runtime to `trainer`, `inference`, or `combined` work |
 | `--backend` | (required) | Backend type (`fsdp` or `megatron`) |
 | `--port` | 8000 | API server port |
 | `--checkpoints-base` | `/tmp/skyrl_checkpoints` | Directory for checkpoint storage |
@@ -58,7 +60,7 @@ cd tinker-cookbook
 TINKER_API_KEY=tml-dummy uv run --with tinker --with datasets \
     python -m tinker_cookbook.recipes.sl_loop \
     base_url=http://localhost:8000 \
-    model_name="Qwen/Qwen3-0.6B" \
+    model_name="Qwen/Qwen3-4B-Instruct-2507" \
     train_on_what=LAST_ASSISTANT_MESSAGE
 ```
 

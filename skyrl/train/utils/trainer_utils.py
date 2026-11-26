@@ -1,4 +1,5 @@
 import json
+import math
 import os
 from collections import defaultdict
 from enum import Enum
@@ -14,18 +15,44 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoTokenizer
 
 from skyrl.backends.skyrl_train.utils.io import io
+from skyrl.backends.skyrl_train.utils.sample_support import SAMPLE_SUPPORT_FIELD
 from skyrl.backends.skyrl_train.workers.worker import PPORayActorGroup
-from skyrl.train.config import SkyRLTrainConfig, TrainerConfig
+from skyrl.backends.skyrl_train.workers.worker_utils import (
+    MINIBATCH_ROLLOUT_LOGPROB_DIFF_MEAN_KEY,
+    MINIBATCH_ROLLOUT_LOGPROB_DIFF_SQ_MEAN_KEY,
+    MINIBATCH_ROLLOUT_LOGPROB_DIFF_STD_KEY,
+)
+from skyrl.train.config import SkyRLTrainConfig
 from skyrl.train.dataset import PromptDataset
 from skyrl.train.generators.base import GeneratorOutput
 from skyrl.train.generators.utils import (
     concatenate_generator_outputs,
     get_metrics_from_generator_output,
+    slice_generator_output,
 )
+from skyrl.train.utils import deadline
 
 BasicType = Union[int, float, str, bool, type(None)]
 
 GLOBAL_STEP_PREFIX = "global_step_"
+
+
+def finalize_minibatch_rollout_logprob_diff_std(metrics: Dict[str, float]) -> None:
+    """Reconstruct the logprob-diff std from its reduced first/second moments, in place.
+
+    Std can't be mean-reduced across micro-batches/DP/mini-batches, so the workers emit the
+    moments and we derive ``std = sqrt(E[x^2] - E[x]^2)`` here. Replaces the second-moment key
+    with the std; no-op when the moments are absent (e.g. critic training, or no rollout logprobs).
+    """
+    if (
+        MINIBATCH_ROLLOUT_LOGPROB_DIFF_MEAN_KEY not in metrics
+        or MINIBATCH_ROLLOUT_LOGPROB_DIFF_SQ_MEAN_KEY not in metrics
+    ):
+        return
+    mean = metrics[MINIBATCH_ROLLOUT_LOGPROB_DIFF_MEAN_KEY]
+    sq_mean = metrics.pop(MINIBATCH_ROLLOUT_LOGPROB_DIFF_SQ_MEAN_KEY)
+    # max(0, ...) guards tiny negatives from float round-off.
+    metrics[MINIBATCH_ROLLOUT_LOGPROB_DIFF_STD_KEY] = math.sqrt(max(0.0, sq_mean - mean**2))
 
 
 class ResumeMode(Enum):
@@ -50,13 +77,19 @@ def get_node_ids(
         critic_model: Critic model actor group (Optional)
         ref_model: Ref model actor group (Optional)
     """
-    policy_node_ids: List[str] = ray.get(policy_model.async_run_ray_method("pass_through", "get_ray_node_id"))
+    policy_node_ids: List[str] = deadline.ray_get(
+        policy_model.async_run_ray_method("pass_through", "get_ray_node_id"), "get_policy_ray_node_id"
+    )
     if critic_model is not None:
-        critic_node_ids: List[str] = ray.get(critic_model.async_run_ray_method("pass_through", "get_ray_node_id"))
+        critic_node_ids: List[str] = deadline.ray_get(
+            critic_model.async_run_ray_method("pass_through", "get_ray_node_id"), "get_critic_ray_node_id"
+        )
     else:
         critic_node_ids = []
     if ref_model is not None:
-        ref_node_ids: List[str] = ray.get(ref_model.async_run_ray_method("pass_through", "get_ray_node_id"))
+        ref_node_ids: List[str] = deadline.ray_get(
+            ref_model.async_run_ray_method("pass_through", "get_ray_node_id"), "get_ref_ray_node_id"
+        )
     else:
         ref_node_ids = []
 
@@ -86,7 +119,7 @@ def run_on_each_node(node_ids: List[str], fn: Callable, *args, **kwargs):
         )
         refs.append(node_task.remote(*args, **kwargs))
 
-    return ray.get(refs)
+    return deadline.ray_get(refs, "run_on_each_node")
 
 
 def extract_step_from_path(path: str) -> int:
@@ -237,6 +270,63 @@ def calculate_per_dataset_metrics(
         eval_metrics[f"eval/{sanitized_data_source}/mean_positive_reward"] = overall_metrics["mean_positive_reward"]
 
     return eval_metrics
+
+
+def get_intra_group_completion_time_std_cv(
+    generator_output: GeneratorOutput,
+) -> Tuple[Optional[float], Optional[float]]:
+    """Intra-group spread of per-trajectory completion times for a single group.
+
+    Returns ``(std, cv)`` where ``std`` is the population standard deviation (seconds) and ``cv``
+    is the coefficient of variation (``std / mean``). Both are ``None`` when the group recorded no
+    completion times or has fewer than two trajectories.
+    """
+    traj_times = generator_output.get("trajectory_generation_times")
+    group_std = None
+    group_cv = None
+    if traj_times and len(traj_times) > 1:
+        # For step wise training, each turn /step contributes one entry.
+        # Only take the metrics from the last step
+        is_last_step = generator_output.get("is_last_step")
+        if is_last_step:
+            traj_times = [t for t, last in zip(traj_times, is_last_step) if last]
+        traj_times_arr = np.array(traj_times, dtype=np.float64)
+        # Population std of per-trajectory completion times within this group (seconds).
+        group_std = float(traj_times_arr.std())
+        # Coefficient of variation = std / mean. Guard against div-by-zero.
+        mean_traj_time = float(traj_times_arr.mean())
+        if mean_traj_time > 0:
+            group_cv = group_std / mean_traj_time
+    return group_std, group_cv
+
+
+def get_group_completion_metrics(
+    group_completion_times: Optional[List[float]],
+    intra_group_stds: Optional[List[float]],
+    intra_group_cvs: Optional[List[float]],
+) -> Dict[str, float]:
+    """Per-group completion-time statistics for the groups consumed in a step.
+
+    These surface generation load-balancing behavior (e.g. across vllm-router routing policies):
+    tail group latency (p90/max) and how unevenly trajectories within a group finish (intra-group
+    coefficient of variation). Each input may be empty/None, in which case the corresponding metrics
+    are omitted.
+    """
+    metrics = {}
+    if group_completion_times:
+        group_times_arr = np.array(group_completion_times, dtype=np.float64)
+        metrics.update(
+            {
+                "generate/group_completion_time_mean": float(group_times_arr.mean()),
+                "generate/group_completion_time_p90": float(np.percentile(group_times_arr, 90)),
+                "generate/group_completion_time_max": float(group_times_arr.max()),
+            }
+        )
+    if intra_group_stds:
+        metrics.update({"generate/intra_group_completion_time_std_mean": float(np.mean(intra_group_stds))})
+    if intra_group_cvs:
+        metrics.update({"generate/intra_group_completion_time_cv_mean": float(np.mean(intra_group_cvs))})
+    return metrics
 
 
 def dump_per_dataset_eval_results(
@@ -408,20 +498,11 @@ def handle_replace_sampling(
         for uid in bad_uids:
             bad_indices.extend(uid2indices[uid])
 
-        # Replace bad samples with good ones (modify in place because replacement_idx and bad_idx should not overlap)
+        source_indices = list(range(len(uids)))
         for bad_idx, replacement_idx in zip(bad_indices, replacement_indices):
-            generator_output["prompt_token_ids"][bad_idx] = generator_output["prompt_token_ids"][replacement_idx].copy()
-            generator_output["response_ids"][bad_idx] = generator_output["response_ids"][replacement_idx].copy()
-            replacement_reward = generator_output["rewards"][replacement_idx]
-            generator_output["rewards"][bad_idx] = (
-                replacement_reward.copy() if isinstance(replacement_reward, list) else replacement_reward
-            )
-            generator_output["loss_masks"][bad_idx] = generator_output["loss_masks"][replacement_idx].copy()
-            if generator_output["stop_reasons"]:
-                generator_output["stop_reasons"][bad_idx] = generator_output["stop_reasons"][replacement_idx]
-
-            if generator_output["rollout_logprobs"]:
-                generator_output["rollout_logprobs"][bad_idx] = generator_output["rollout_logprobs"][replacement_idx]
+            source_indices[bad_idx] = replacement_idx
+        if bad_indices:
+            generator_output = slice_generator_output(generator_output, source_indices)
 
         # Update UIDs accordingly
         replaced_uids = uids.copy()
@@ -550,50 +631,60 @@ def get_bad_sample_replacements(good_uids: List[str], bad_uids: List[str]) -> Li
 
 def filter_generator_output(output: GeneratorOutput, kept_indices: List[int]) -> GeneratorOutput:
     """Filter GeneratorOutput based on kept indices."""
-    filtered = {
-        "prompt_token_ids": [output["prompt_token_ids"][i] for i in kept_indices],
-        "response_ids": [output["response_ids"][i] for i in kept_indices],
-        "rewards": [output["rewards"][i] for i in kept_indices],
-        "loss_masks": [output["loss_masks"][i] for i in kept_indices],
-        "stop_reasons": None,
-        "rollout_metrics": output.get("rollout_metrics"),
-        "rollout_logprobs": (
-            [output["rollout_logprobs"][i] for i in kept_indices] if output["rollout_logprobs"] else None
-        ),
-    }
-
-    if output.get("stop_reasons"):
-        filtered["stop_reasons"] = [output["stop_reasons"][i] for i in kept_indices]
-
-    return filtered
+    return slice_generator_output(output, kept_indices)
 
 
-def zero_variance_filter(rewards: List[float], uids: List[str]) -> List[int]:
+def zero_variance_filter(
+    rewards: List[float],
+    uids: List[str],
+    loss_masks: Optional[List[List[int]]] = None,
+    tol: float = 0.0,
+) -> List[int]:
     """
-    Given a list of trajectory level rewards and uids, return the indices of the trajectories with non-zero variance rewards.
+    Given trajectory-level rewards and uids, return the indices of the trajectories to keep.
+
+    A group (trajectories sharing a uid) is dropped only when it has >1 *live* trajectory and their
+    reward spread is within ``tol`` (no GRPO signal); groups with <=1 live trajectory are always kept.
+    A trajectory is "live" if ``sum(loss_mask) > 0`` (or all live when ``loss_masks`` is None) -- so
+    trajectories masked upstream don't make a genuine zero-variance group look varied.
 
     Args:
         rewards: List[float]
         uids: List[str]
+        loss_masks: Optional per-trajectory loss masks, used to determine which trajectories are live.
+        tol: Two rewards within this absolute tolerance count as equal. 0.0 reproduces exact
+            (``np.std > 0``) behavior; set a small value (e.g. 1e-6) for float (LLM-judge) rewards.
 
     Returns:
         List[int]
     """
-    # Group by UID and calculate standard deviation
-    uid2metric_vals = defaultdict(list)
-    for uid, reward in zip(uids, rewards):
-        uid2metric_vals[uid].append(reward)
+    is_live = [True] * len(rewards) if loss_masks is None else [sum(mask) > 0 for mask in loss_masks]
 
-    # Identify UIDs to keep: non-zero variance or singletons
-    kept_uids_set = {
-        uid for uid, metric_vals in uid2metric_vals.items() if np.std(metric_vals) > 0 or len(metric_vals) == 1
-    }
+    # Group live rewards by UID.
+    uid2live_rewards = defaultdict(list)
+    for uid, reward, live in zip(uids, rewards, is_live):
+        if live:
+            uid2live_rewards[uid].append(reward)
+
+    def _is_zero_variance(uid: str) -> bool:
+        vals = uid2live_rewards.get(uid, [])
+        return len(vals) > 1 and (max(vals) - min(vals)) <= tol
+
+    # Keep everything except groups with >1 live trajectory and no reward spread.
+    kept_uids_set = {uid for uid in set(uids) if not _is_zero_variance(uid)}
 
     # Return indices of trajectories with kept UIDs
     return [i for i, uid in enumerate(uids) if uid in kept_uids_set]
 
 
-def validate_generator_output(num_prompts: int, generator_output: GeneratorOutput, step_wise: bool = False):
+def validate_generator_output(
+    num_prompts: int,
+    generator_output: GeneratorOutput,
+    step_wise: bool = False,
+    routes_expected: bool = False,
+    support_expected: bool = False,
+    support_scores_expected: bool = False,
+):
     """Validate the generator output.
 
     Args:
@@ -602,6 +693,13 @@ def validate_generator_output(num_prompts: int, generator_output: GeneratorOutpu
         step_wise: If True, validate step-wise specific fields (is_last_step, trajectory_ids,
             contiguous ordering). In step-wise mode, num_responses may exceed num_prompts
             because each trajectory is expanded into multiple per-turn samples.
+        routes_expected: R3 is on for this batch, so a batch that trains anything must carry
+            routed experts. Without them the trainer would silently skip replay.
+        support_expected: sample-support replay is on, so a batch that trains anything must carry
+            sampler support. Checked here so a generator that never captures it fails right
+            after generation rather than in the trainer's worker.
+        support_scores_expected: score centering is on, so every support present must carry the
+            sampler's member logprobs.
     """
     if len(generator_output["response_ids"]) <= 0:
         raise RuntimeError("No outputs generated")
@@ -626,6 +724,7 @@ def validate_generator_output(num_prompts: int, generator_output: GeneratorOutpu
             "stop_reasons",
             "trajectory_ids",
             "rollout_expert_indices",
+            "rollout_sample_support",
             "is_last_step",
             "pixel_values",
             "image_grid_thw",
@@ -671,8 +770,81 @@ def validate_generator_output(num_prompts: int, generator_output: GeneratorOutpu
             not isinstance(reward, list) for reward in rewards
         ), "rewards must be `List[float]` or `List[List[float]]`"
 
+    _validate_per_token_side_channels(generator_output, step_wise)
+
+    if routes_expected and generator_output.get("rollout_expert_indices") is None:
+        # A batch with nothing to train (every rollout failed) has nothing to replay either.
+        assert not any(any(mask) for mask in generator_output["loss_masks"]), (
+            "generator.inference_engine.enable_return_routed_experts=True, but the generator returned no "
+            "rollout_expert_indices for a batch with trainable tokens, so routing replay would silently be "
+            "skipped. Use a generator that returns routed experts, or disable R3."
+        )
+    if support_expected and generator_output.get(SAMPLE_SUPPORT_FIELD) is None:
+        assert not any(any(mask) for mask in generator_output["loss_masks"]), (
+            "trainer.algorithm.enable_sample_support_replay=True, but the generator returned no "
+            f"{SAMPLE_SUPPORT_FIELD} for a batch with trainable tokens. Use a generator that captures "
+            "sampler support (it must call generate with return_sample_support), or disable replay."
+        )
+    if support_scores_expected and generator_output.get(SAMPLE_SUPPORT_FIELD) is not None:
+        # A support with no members (a placeholder row) has nothing to score.
+        unscored = [
+            i
+            for i, support in enumerate(generator_output[SAMPLE_SUPPORT_FIELD])
+            if support.logprobs is None and support.num_members
+        ]
+        assert not unscored, (
+            f"trainer.algorithm.enable_score_centering=True, but {len(unscored)} {SAMPLE_SUPPORT_FIELD} entries "
+            f"(first: {unscored[0]}) carry no sampler member logprobs"
+        )
+
     if step_wise:
         _validate_step_wise_fields(generator_output, num_responses)
+
+
+def _validate_per_token_side_channels(generator_output: GeneratorOutput, step_wise: bool):
+    """Validate side-channel row counts against their token domains."""
+    rollout_expert_indices = generator_output.get("rollout_expert_indices")
+    rollout_sample_support = generator_output.get(SAMPLE_SUPPORT_FIELD)
+    prompt_token_ids = generator_output["prompt_token_ids"]
+    response_ids = generator_output["response_ids"]
+
+    if rollout_expert_indices is not None:
+        loss_masks = generator_output["loss_masks"]
+        for i, sample_indices in enumerate(rollout_expert_indices):
+            assert sample_indices is not None, f"rollout_expert_indices[{i}] is None, expected captured routes"
+            prompt_length = len(prompt_token_ids[i])
+            sequence_length = prompt_length + len(response_ids[i])
+            captured_rows = len(sample_indices)
+            assert 0 < captured_rows <= sequence_length, (
+                f"rollout_expert_indices[{i}] has {captured_rows} route rows for a "
+                f"{sequence_length}-token trajectory, expected a non-empty prefix of it"
+            )
+            # Row t covers target t + 1, so every trained target needs a captured row.
+            trained_positions = np.flatnonzero(np.asarray(loss_masks[i]))
+            # A step-wise row's prompt is the history so far, so its routes must be the row's own:
+            # one per token, less at most the last, which the engine never forwards. Routes for the
+            # step's generated tokens alone, or for the whole trajectory on an earlier step, would
+            # replay onto the wrong tokens. A row that trains nothing (masked, or overlong-filtered)
+            # may carry a short dummy route: the trainer pads the rest, and no loss depends on it.
+            assert not (step_wise and trained_positions.size) or captured_rows >= sequence_length - 1, (
+                f"rollout_expert_indices[{i}] has {captured_rows} route rows for a {sequence_length}-token "
+                "step-wise row: step-wise routes must cover the row's whole prompt and response"
+            )
+            if trained_positions.size:
+                last_trained_token = prompt_length + int(trained_positions[-1])
+                assert captured_rows >= last_trained_token, (
+                    f"rollout_expert_indices[{i}] captured {captured_rows} route rows, which stops "
+                    f"short of loss-active token {last_trained_token}: replaying that token on a "
+                    "dummy route trains it on a route the rollout never took"
+                )
+
+    if rollout_sample_support is not None:
+        for i, sample_support in enumerate(rollout_sample_support):
+            assert sample_support is not None, f"{SAMPLE_SUPPORT_FIELD}[{i}] is None, expected captured support"
+            assert len(sample_support) == len(response_ids[i]), (
+                f"{SAMPLE_SUPPORT_FIELD}[{i}] has {len(sample_support)} support rows for "
+                f"{len(response_ids[i])} response tokens, expected one row per response token"
+            )
 
 
 def _validate_step_wise_fields(generator_output: GeneratorOutput, num_responses: int):
@@ -751,7 +923,7 @@ def _validate_step_wise_fields(generator_output: GeneratorOutput, num_responses:
 
 
 def build_dataloader(
-    cfg: SkyRLTrainConfig, dataset: PromptDataset, is_train=True, is_fully_async=False
+    cfg: SkyRLTrainConfig, dataset: PromptDataset, is_train: bool = True, is_fully_async: bool = False
 ) -> StatefulDataLoader:
     """
     Build the dataloader for the training or evaluation dataset.
@@ -770,19 +942,24 @@ def build_dataloader(
     seeded_generator = torch.Generator()
     seeded_generator.manual_seed(cfg.trainer.seed)
 
+    num_workers = cfg.data.dataloader.num_workers
+    assert num_workers is not None, "dataloader `num_workers` should be non-null"
+
     dataloader = StatefulDataLoader(
         dataset,
         batch_size=batch_size if not is_fully_async else 1,
         shuffle=True if is_train else False,
         collate_fn=dataset.collate_fn,
-        # TODO(Charlie): debug why inference http endpoint is slow when num_workers is 8
-        num_workers=0 if cfg.generator.inference_engine.enable_http_endpoint else 8,
+        num_workers=num_workers,
+        # Unlike `shuffle`/`drop_last`, not branched on `is_train`: both dataloaders are
+        # reused (train across epochs, eval across evaluations) to avoid worker respawn
+        persistent_workers=cfg.data.dataloader.persistent_workers,
         drop_last=True if is_train else False,
         generator=seeded_generator,
         # NOTE (sumanthrh): We use ray and thus use `spawn` start method.
         # forking within ray leads to undefined behaviour and often causes hard to debug
         # memory leaks.  See: https://docs.ray.io/en/latest/ray-core/patterns/fork-new-processes.html
-        multiprocessing_context="spawn" if not cfg.generator.inference_engine.enable_http_endpoint else None,
+        multiprocessing_context="spawn" if num_workers > 0 else None,
     )
     if is_train:
         if not is_fully_async:
@@ -793,11 +970,3 @@ def build_dataloader(
         logger.info(f"Validation set size: {len(dataloader)}")
 
     return dataloader
-
-
-def get_rope_scaling_config(trainer_cfg: TrainerConfig) -> dict[str, Any]:
-    return trainer_cfg.rope_scaling
-
-
-def get_rope_theta_config(trainer_cfg: TrainerConfig) -> int | None:
-    return trainer_cfg.rope_theta

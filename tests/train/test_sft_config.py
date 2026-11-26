@@ -7,13 +7,15 @@ correctly bridged to the internal SkyRLTrainConfig by build_skyrl_config_for_sft
 uv run --isolated --extra dev pytest tests/train/test_sft_config.py -v
 """
 
+import pathlib
+
 import pytest
 
 from skyrl.train.config import (
     SFTConfig,
     build_skyrl_config_for_sft,
 )
-from skyrl.train.config.sft_config import validate_sft_cfg
+from skyrl.train.config.sft_config import _normalize_dataset_cfg, validate_sft_cfg
 
 
 def _sft_cfg_from_overrides(overrides: list[str]) -> SFTConfig:
@@ -33,6 +35,101 @@ class TestFSDP2StrategyAlias:
         assert cfg.strategy == "fsdp"
 
 
+class TestUseSamplePackingAlias:
+    """`use_sample_packing` is accepted as a deprecated alias for `remove_microbatch_padding`."""
+
+    def test_use_sample_packing_remapped_with_warning(self):
+        with pytest.warns(DeprecationWarning, match="use_sample_packing.*has been renamed"):
+            cfg = _sft_cfg_from_overrides(["use_sample_packing=true"])
+        assert cfg.remove_microbatch_padding is True
+
+    def test_use_sample_packing_remapped_from_dict(self):
+        with pytest.warns(DeprecationWarning, match="use_sample_packing.*has been renamed"):
+            cfg = SFTConfig.from_cli_overrides({"use_sample_packing": False})
+        assert cfg.remove_microbatch_padding is False
+
+    def test_use_sample_packing_with_new_key_raises(self):
+        with pytest.raises(ValueError, match="only one of use_sample_packing"):
+            _sft_cfg_from_overrides(["use_sample_packing=true", "remove_microbatch_padding=false"])
+
+
+class TestCliOverridesFromDict:
+    """Dict overrides round-trip by type rather than through YAML re-parsing.
+
+    See https://github.com/NovaSky-AI/SkyRL/issues/1567.
+    """
+
+    def test_none_values_stay_none(self):
+        """``None`` values arrive as ``None``, not the string ``"None"``."""
+        cfg = SFTConfig.from_cli_overrides(
+            {
+                "max_training_steps": None,
+                "num_steps": None,
+                "sampler_class_path": None,
+            }
+        )
+        assert cfg.max_training_steps is None
+        assert cfg.num_steps is None
+        assert cfg.sampler_class_path is None
+
+    def test_none_override_passes_validation(self):
+        """A ``None`` ``max_training_steps`` override passes ``validate_sft_cfg``.
+
+        ``validate_sft_cfg`` compares ``max_training_steps`` against ``0``, which
+        raises ``TypeError`` for a string.
+        """
+        cfg = SFTConfig.from_cli_overrides({"max_training_steps": None, "model.path": "test/my-model"})
+        validate_sft_cfg(cfg)
+        assert cfg.max_training_steps is None
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "null",
+            "true",
+            "",
+            "[not-a-list]",
+            "{not: a-dict}",
+            "name: with colon",
+        ],
+    )
+    def test_string_values_stay_strings(self, value):
+        cfg = SFTConfig.from_cli_overrides({"run_name": value})
+        assert cfg.run_name == value
+
+    def test_scalar_and_container_values_keep_their_types(self):
+        cfg = SFTConfig.from_cli_overrides(
+            {
+                "num_steps": 10,
+                "remove_microbatch_padding": True,
+                "use_sequence_packing": False,
+                "model.path": "Qwen/Qwen3-0.6B",
+            }
+        )
+        assert cfg.num_steps == 10
+        assert cfg.remove_microbatch_padding is True
+        assert cfg.use_sequence_packing is False
+        assert cfg.model.path == "Qwen/Qwen3-0.6B"
+
+    def test_non_json_serializable_values_fall_back_to_str(self):
+        cfg = SFTConfig.from_cli_overrides({"model.path": pathlib.Path("/tmp/model")})
+        assert cfg.model.path == "/tmp/model"
+
+    @pytest.mark.parametrize(
+        ("dict_value", "dotlist_arg", "expected"),
+        [
+            pytest.param(None, "num_steps=null", None, id="none"),
+            pytest.param(5, "num_steps=5", 5, id="int"),
+        ],
+    )
+    def test_dict_and_dotlist_paths_agree(self, dict_value, dotlist_arg, expected):
+        """A dict override matches the dotlist spelling of the same value."""
+        from_dict = SFTConfig.from_cli_overrides({"num_steps": dict_value})
+        from_list = SFTConfig.from_cli_overrides([dotlist_arg])
+        assert from_dict.num_steps == expected
+        assert from_list.num_steps == expected
+
+
 class TestTopLevelOverrides:
     """Top-level SFTConfig fields bridge to the correct SkyRLTrainConfig paths."""
 
@@ -41,14 +138,32 @@ class TestTopLevelOverrides:
         skyrl_cfg = build_skyrl_config_for_sft(cfg)
         assert skyrl_cfg.trainer.policy.model.path == "test/my-model"
 
-    def test_use_sample_packing_propagates(self):
-        cfg = _sft_cfg_from_overrides(["use_sample_packing=false"])
+    def test_remove_microbatch_padding_propagates(self):
+        cfg = _sft_cfg_from_overrides(["remove_microbatch_padding=false"])
         skyrl_cfg = build_skyrl_config_for_sft(cfg)
-        assert skyrl_cfg.trainer.use_sample_packing is False
+        assert skyrl_cfg.trainer.remove_microbatch_padding is False
 
-        cfg_on = _sft_cfg_from_overrides(["use_sample_packing=true"])
+        cfg_on = _sft_cfg_from_overrides(["remove_microbatch_padding=true"])
         skyrl_cfg_on = build_skyrl_config_for_sft(cfg_on)
-        assert skyrl_cfg_on.trainer.use_sample_packing is True
+        assert skyrl_cfg_on.trainer.remove_microbatch_padding is True
+
+    def test_language_model_only_bridges_to_policy(self):
+        skyrl_cfg = build_skyrl_config_for_sft(_sft_cfg_from_overrides([]))
+        assert skyrl_cfg.trainer.policy.language_model_only is False
+
+        cfg = _sft_cfg_from_overrides(["language_model_only=true"])
+        skyrl_cfg = build_skyrl_config_for_sft(cfg)
+        assert skyrl_cfg.trainer.policy.language_model_only is True
+
+    def test_fused_lm_head_logprob_bridges_to_trainer(self):
+        skyrl_cfg = build_skyrl_config_for_sft(_sft_cfg_from_overrides([]))
+        assert skyrl_cfg.trainer.fused_lm_head_logprob is False
+        assert skyrl_cfg.trainer.logprobs_chunk_size == 1024
+
+        cfg = _sft_cfg_from_overrides(["fused_lm_head_logprob=true", "logprobs_chunk_size=2048"])
+        skyrl_cfg = build_skyrl_config_for_sft(cfg)
+        assert skyrl_cfg.trainer.fused_lm_head_logprob is True
+        assert skyrl_cfg.trainer.logprobs_chunk_size == 2048
 
 
 class TestMegatronConfigOverrides:
@@ -116,6 +231,61 @@ class TestLoraConfigOverrides:
         assert skyrl_cfg.trainer.policy.model.lora.rank == 0
 
 
+class TestTorchProfilerConfigOverrides:
+    """SFT profiler config bridge coverage."""
+
+    def test_disabled_by_default(self):
+        cfg = _sft_cfg_from_overrides([])
+        skyrl_cfg = build_skyrl_config_for_sft(cfg)
+        assert skyrl_cfg.trainer.policy.torch_profiler_config.enable is False
+
+    def test_enable_and_schedule_propagate(self):
+        cfg = _sft_cfg_from_overrides(
+            [
+                "torch_profiler_config.enable=true",
+                "torch_profiler_config.skip_first=3",
+                "torch_profiler_config.active=2",
+                "torch_profiler_config.repeat=0",
+                "torch_profiler_config.save_path=/tmp/sft_prof",
+            ]
+        )
+        skyrl_cfg = build_skyrl_config_for_sft(cfg)
+        prof = skyrl_cfg.trainer.policy.torch_profiler_config
+        assert prof.enable is True
+        assert prof.skip_first == 3
+        assert prof.active == 2
+        assert prof.repeat == 0
+        assert prof.save_path == "/tmp/sft_prof"
+
+    def test_capture_flags_propagate(self):
+        cfg = _sft_cfg_from_overrides(
+            [
+                "torch_profiler_config.enable=true",
+                "torch_profiler_config.profile_memory=true",
+                "torch_profiler_config.with_stack=false",
+                "torch_profiler_config.activities=[cuda]",
+                "torch_profiler_config.save_path=/tmp/sft_prof",
+            ]
+        )
+        skyrl_cfg = build_skyrl_config_for_sft(cfg)
+        prof = skyrl_cfg.trainer.policy.torch_profiler_config
+        assert prof.profile_memory is True
+        assert prof.with_stack is False
+        assert list(prof.activities) == ["cuda"]
+
+    def test_invalid_profiler_config_rejected_by_sft_validation(self):
+        cfg = _sft_cfg_from_overrides(
+            [
+                "model.path=test/my-model",
+                "torch_profiler_config.enable=true",
+                "torch_profiler_config.export_type=bogus",
+                "torch_profiler_config.save_path=/tmp/sft_prof",
+            ]
+        )
+        with pytest.raises(ValueError, match=r"export_type"):
+            build_skyrl_config_for_sft(cfg)
+
+
 class TestFSDPConfigOverrides:
     """FSDP config overrides propagate when strategy=fsdp."""
 
@@ -138,3 +308,227 @@ class TestFSDPConfigOverrides:
         )
         skyrl_cfg = build_skyrl_config_for_sft(cfg)
         assert skyrl_cfg.trainer.policy.fsdp_config.reshard_after_forward is False
+
+
+class TestMaxTokensPerMicrobatch:
+    """``max_tokens_per_microbatch`` is the FFD bin capacity.
+
+    It must be ``>= max_length`` (any single sequence fits in a bin) but need
+    not be a multiple of ``max_length``.
+    """
+
+    def _packed_cfg(self, **overrides) -> SFTConfig:
+        cfg = SFTConfig(
+            strategy="megatron",
+            max_length=128,
+            remove_microbatch_padding=True,
+            use_sequence_packing=True,
+        )
+        cfg.model.path = "test/my-model"
+        for key, value in overrides.items():
+            setattr(cfg, key, value)
+        return cfg
+
+    def test_none_resolves_to_max_length(self):
+        cfg = self._packed_cfg(max_tokens_per_microbatch=None)
+        validate_sft_cfg(cfg)
+        assert cfg.resolved_bin_capacity() == 128
+
+    def test_equal_to_max_length_accepted(self):
+        cfg = self._packed_cfg(max_tokens_per_microbatch=128)
+        validate_sft_cfg(cfg)
+        assert cfg.resolved_bin_capacity() == 128
+
+    def test_non_multiple_above_max_length_accepted(self):
+        # The old "must be a multiple of max_length" rule is gone: any budget
+        # >= max_length is a valid bin capacity.
+        cfg = self._packed_cfg(max_tokens_per_microbatch=200)
+        validate_sft_cfg(cfg)
+        assert cfg.resolved_bin_capacity() == 200
+
+    def test_below_max_length_rejected(self):
+        cfg = self._packed_cfg(max_tokens_per_microbatch=64)
+        with pytest.raises(ValueError, match="must be >= max_length"):
+            validate_sft_cfg(cfg)
+
+    def test_bridge_sets_worker_micro_batch_size_to_one(self):
+        # Each bin row is one worker micro-batch.
+        cfg = self._packed_cfg(max_tokens_per_microbatch=256, micro_train_batch_size_per_gpu=4)
+        skyrl_cfg = build_skyrl_config_for_sft(cfg)
+        assert skyrl_cfg.trainer.micro_train_batch_size_per_gpu == 1
+
+
+class TestDatasetConfigNormalization:
+    """Deprecated single-dataset fields translate to the list-based fields (RFC #1875)."""
+
+    def test_zero_config_defaults(self):
+        cfg = SFTConfig()
+        _normalize_dataset_cfg(cfg)
+        assert cfg.train_datasets == ["yahma/alpaca-cleaned"]
+        assert cfg.train_dataset_splits == ["train[:100]"]
+        assert cfg.train_dataset_weights == [1.0]
+        assert cfg.dataset_name is None and cfg.dataset_split is None
+        assert cfg.eval_datasets is None  # eval stays disabled
+
+    def test_deprecated_train_fields_translate_with_warning(self):
+        with pytest.warns(DeprecationWarning, match="dataset_name/dataset_split are deprecated"):
+            cfg = _sft_cfg_from_overrides(["dataset_name=foo/bar", "dataset_split=train[:50]"])
+            _normalize_dataset_cfg(cfg)
+        assert cfg.train_datasets == ["foo/bar"]
+        assert cfg.train_dataset_splits == ["train[:50]"]
+        assert cfg.dataset_name is None and cfg.dataset_split is None
+
+    def test_deprecated_translation_works_programmatically(self):
+        cfg = SFTConfig()
+        cfg.dataset_name = "foo/bar"
+        with pytest.warns(DeprecationWarning, match="dataset_name/dataset_split are deprecated"):
+            validate_sft_cfg(cfg)
+        assert cfg.train_datasets == ["foo/bar"]
+        assert cfg.train_dataset_splits == ["train[:100]"]  # split default preserved
+
+    def test_deprecated_eval_fields_translate_with_warning(self):
+        with pytest.warns(DeprecationWarning, match="eval_dataset_name/eval_dataset_split are deprecated"):
+            cfg = _sft_cfg_from_overrides(["eval_dataset_name=baz/qux"])
+            _normalize_dataset_cfg(cfg)
+        assert cfg.eval_datasets == ["baz/qux"]
+        assert cfg.eval_dataset_splits == ["validation"]  # old default preserved
+        assert cfg.eval_dataset_names == ["baz_qux"]  # "/" sanitized for logging
+        assert cfg.eval_dataset_name is None and cfg.eval_dataset_split is None
+
+    def test_old_and_new_train_fields_conflict(self):
+        cfg = _sft_cfg_from_overrides(["dataset_name=x", "train_datasets=[a]", "train_dataset_splits=[s]"])
+        with pytest.raises(ValueError, match="only one of train_datasets"):
+            _normalize_dataset_cfg(cfg)
+
+    def test_old_and_new_eval_fields_conflict(self):
+        cfg = _sft_cfg_from_overrides(["eval_dataset_name=x", "eval_datasets=[a]", "eval_dataset_splits=[s]"])
+        with pytest.raises(ValueError, match="only one of eval_datasets"):
+            _normalize_dataset_cfg(cfg)
+
+    def test_idempotent(self):
+        cfg = _sft_cfg_from_overrides(["train_datasets=[a,b]", "train_dataset_splits=[s1,s2]", "sampler=sequential"])
+        _normalize_dataset_cfg(cfg)
+        first = (cfg.train_datasets, cfg.train_dataset_splits, cfg.train_dataset_weights)
+        _normalize_dataset_cfg(cfg)
+        assert (cfg.train_datasets, cfg.train_dataset_splits, cfg.train_dataset_weights) == first
+
+
+class TestMultiDatasetValidation:
+    """List-shaped dataset fields are validated for lengths, weights and names."""
+
+    def test_bracketed_splits_parse_with_inner_quotes(self):
+        # HF slice syntax nests brackets inside the OmegaConf list, so each
+        # element must be quoted on the CLI: "train_dataset_splits=['train[:2000]']".
+        # (Unquoted elements with brackets are a YAML parse error.)
+        cfg = _sft_cfg_from_overrides(
+            [
+                "train_datasets=['allenai/tulu-3-sft-mixture','yahma/alpaca-cleaned']",
+                "train_dataset_splits=['train[:50000]','train[:10000]']",
+            ]
+        )
+        _normalize_dataset_cfg(cfg)
+        assert list(cfg.train_datasets) == ["allenai/tulu-3-sft-mixture", "yahma/alpaca-cleaned"]
+        assert list(cfg.train_dataset_splits) == ["train[:50000]", "train[:10000]"]
+
+    def test_default_weights_are_equal_mixing(self):
+        cfg = _sft_cfg_from_overrides(["train_datasets=[a,b,c,d]", "train_dataset_splits=[s,s,s,s]"])
+        _normalize_dataset_cfg(cfg)
+        assert cfg.train_dataset_weights == pytest.approx([0.25] * 4)
+
+    def test_splits_length_mismatch_rejected(self):
+        cfg = _sft_cfg_from_overrides(["train_datasets=[a,b]", "train_dataset_splits=[s1]"])
+        with pytest.raises(ValueError, match="one split per entry"):
+            _normalize_dataset_cfg(cfg)
+
+    def test_missing_splits_rejected(self):
+        cfg = _sft_cfg_from_overrides(["train_datasets=[a,b]"])
+        with pytest.raises(ValueError, match="one split per entry"):
+            _normalize_dataset_cfg(cfg)
+
+    def test_weights_length_mismatch_rejected(self):
+        cfg = _sft_cfg_from_overrides(
+            ["train_datasets=[a,b]", "train_dataset_splits=[s,s]", "train_dataset_weights=[1.0]"]
+        )
+        with pytest.raises(ValueError, match="one weight per entry"):
+            _normalize_dataset_cfg(cfg)
+
+    def test_nonpositive_weights_rejected(self):
+        cfg = _sft_cfg_from_overrides(
+            ["train_datasets=[a,b]", "train_dataset_splits=[s,s]", "train_dataset_weights=[1.0,0.0]"]
+        )
+        with pytest.raises(ValueError, match="must all be > 0"):
+            _normalize_dataset_cfg(cfg)
+
+    def test_weights_require_random_sampler(self):
+        cfg = _sft_cfg_from_overrides(
+            [
+                "train_datasets=[a,b]",
+                "train_dataset_splits=[s,s]",
+                "train_dataset_weights=[0.5,0.5]",
+                "sampler=sequential",
+            ]
+        )
+        with pytest.raises(ValueError, match="only supported with sampler='random'"):
+            _normalize_dataset_cfg(cfg)
+
+    def test_eval_names_default_collision_rejected(self):
+        cfg = _sft_cfg_from_overrides(["eval_datasets=[a/b,a/b]", "eval_dataset_splits=[s1,s2]"])
+        with pytest.raises(ValueError, match="names collide"):
+            _normalize_dataset_cfg(cfg)
+
+    def test_eval_names_explicit_disambiguate(self):
+        cfg = _sft_cfg_from_overrides(
+            ["eval_datasets=[a/b,a/b]", "eval_dataset_splits=[s1,s2]", "eval_dataset_names=[early,late]"]
+        )
+        _normalize_dataset_cfg(cfg)
+        assert cfg.eval_dataset_names == ["early", "late"]
+
+    def test_eval_names_duplicates_rejected(self):
+        cfg = _sft_cfg_from_overrides(["eval_datasets=[a,b]", "eval_dataset_splits=[s,s]", "eval_dataset_names=[x,x]"])
+        with pytest.raises(ValueError, match="must be unique"):
+            _normalize_dataset_cfg(cfg)
+
+    def test_eval_names_length_mismatch_rejected(self):
+        cfg = _sft_cfg_from_overrides(["eval_datasets=[a,b]", "eval_dataset_splits=[s,s]", "eval_dataset_names=[x]"])
+        with pytest.raises(ValueError, match="one name per entry"):
+            _normalize_dataset_cfg(cfg)
+
+    def test_eval_lists_without_eval_datasets_rejected(self):
+        cfg = _sft_cfg_from_overrides(["eval_dataset_splits=[s]"])
+        with pytest.raises(ValueError, match="require eval_datasets"):
+            _normalize_dataset_cfg(cfg)
+
+    def test_eval_interval_requires_eval_datasets(self):
+        cfg = _sft_cfg_from_overrides(["eval_interval=5"])
+        with pytest.raises(ValueError, match="requires eval_datasets"):
+            validate_sft_cfg(cfg)
+
+
+@pytest.mark.parametrize(
+    "overrides, match",
+    [
+        (["strategy=fsdp"], "requires strategy='megatron'"),
+        (["ckpt_path=s3://bucket/ckpts"], "local ckpt_path"),
+    ],
+)
+def test_optimizer_offload_to_disk_rejects_settings_it_cannot_honor(overrides, match):
+    cfg = _sft_cfg_from_overrides(["megatron_config.optimizer_offload_to_disk.dir=/tmp/state", *overrides])
+
+    with pytest.raises(ValueError, match=match):
+        validate_sft_cfg(cfg)
+
+
+@pytest.mark.parametrize("ep, valid", [(1, True), (2, True), (8, False)])
+def test_megatron_expert_grid_must_divide_the_world_size(ep, valid):
+    """Megatron's expert grid (pp * ep * etp) must divide the GPUs like the dense one, for a dense model too."""
+    cfg = _sft_cfg_from_overrides(
+        ["strategy=megatron", "placement.num_gpus_per_node=2", f"megatron_config.expert_model_parallel_size={ep}"]
+    )
+
+    if valid:
+        validate_sft_cfg(cfg)
+    else:
+        with pytest.raises(
+            ValueError, match=r"divisible by Megatron's expert grid \(pp \* ep \* etp\) 8\. megatron_config\."
+        ):
+            validate_sft_cfg(cfg)

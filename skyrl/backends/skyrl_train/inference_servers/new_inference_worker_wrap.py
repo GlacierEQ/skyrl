@@ -1,23 +1,33 @@
-"""
-vLLM Worker Extension for native weight sync with chunked transfer support.
+"""vLLM worker extension for the two weight-sync things an engine cannot do.
 
-This module provides NewInferenceWorkerWrap, a vLLM worker extension that
-enables chunked weight updates from training to inference using the
-start/update/finish lifecycle:
+Weight transfer itself does not route through here: the receive path is an engine
+subclass (``weight_sync/weight_receivers.py``, ``weight_sync/delta/engine.py``,
+``weight_sync/sharded_rdt/sharded_rdt_engine.py``) driven over vLLM's native
+RLHF routes.
 
-    start_weight_update   ->  one or more update_weights_chunk  ->  finish_weight_update
+What remains are limits of *dispatch*:
 
-This separates the layerwise reload initialization/finalization from individual
-chunk transfers, allowing weights to be sent in bounded-memory chunks rather
-than all at once.
+``fetch_weights``
+    ``/collective_rpc`` dispatches to worker methods by name and refuses
+    callables (``entrypoints/serve/dev/rpc/api_router.py``), and no native route
+    can invoke an arbitrary engine method. SkyRL's ``/fetch_weights`` route
+    (``vllm_server_actor``) collective-RPCs into this method. It is called
+    *before* ``pause_generation`` so the checkpoint-delta download overlaps live
+    generation.
 
-Used only with the new inference path (_SKYRL_USE_NEW_INFERENCE=1).
+the LoRA receive target
+    ``lora.sync_mode=memory`` sends a PEFT adapter down the ordinary transport,
+    and the receiving engine needs the adapter's name, config and alias map to
+    apply it. The native round trip carries only names, dtypes and shapes, so
+    the target is armed out of band, one round at a time, through
+    ``skyrl_set_lora_receive_target`` (see ``weight_sync/lora_target.py``).
 
-TODO: Once https://github.com/vllm-project/vllm/pull/39212 lands, vLLM will
-natively support start_weight_update / update_weights / finish_weight_update
-on GPUWorker with dedicated HTTP endpoints. At that point this worker extension
-can be removed and SkyRL can call the native endpoints directly instead of
-routing through /collective_rpc.
+sleep / wake
+    ``EngineCore.sleep`` hardcodes ``clear_prefix_cache = level >= 1``
+    (``v1/engine/core.py``) with no parameter, and ``CuMemBackend.suspend`` maps
+    level to tags as ``("weights",)`` / ``()`` with no way to express "discard
+    weights, offload kv_cache". A custom ``SleepModeBackend`` does not help: the
+    problem is on the dispatch path, not in the suspend mechanism.
 
 Usage:
     Pass as --worker-extension-cls to vLLM:
@@ -26,178 +36,442 @@ Usage:
         skyrl.backends.skyrl_train.inference_servers.new_inference_worker_wrap.NewInferenceWorkerWrap
 """
 
+import logging
+from typing import TYPE_CHECKING, Any, Iterable
+
 import torch
 
-# Workaround for a vLLM layerwise-reload corruption affecting NemotronH/Mamba.
-# MambaMixer2 registers `conv_weights` as a non-persistent buffer that is a
-# view of `self.conv1d.weight.data` (shared storage). vLLM's reload code path
-# (model_executor/model_loader/reload/layerwise.py) materializes the buffer
-# into a fresh uninitialized GPU tensor and then runs
-# `kernel_conv_weights.data.copy_(fresh)` in `_copy_and_restore_kernel_tensors`.
-# Because the kernel buffer shares storage with `conv1d.weight.data`, this
-# writes garbage (NaN-bit-pattern bytes in bf16) into the conv1d weight,
-# corrupting all 23 Mamba layers after every weight sync.
-#
-# Adding "conv_weights" to vLLM's SKIP_TENSORS makes capture/restore/materialize
-# skip the buffer entirely, so the view stays intact and conv1d.weight is
-# preserved. Must be applied before `record_metadata_for_reloading` runs at
-# model construction; this module is imported by vLLM via
-# --worker-extension-cls before model init, so the import-time patch is
-# correctly ordered.
-# Remove this pending https://github.com/vllm-project/vllm/pull/42481 which should
-# be included in vLLM 0.21.0
+from skyrl.backends.skyrl_train.inference_servers.vllm_compat import (
+    normalize_fp8_kv_scales_after_wake,
+    patch_vllm_dummy_weight_boot_detection,
+    patch_vllm_fp8_kv_scale_boot_normalization,
+    patch_vllm_fp8_kv_scale_completion,
+    patch_vllm_sleep_model_state,
+    restore_model_state_tensors,
+    save_model_state_tensors,
+)
+from skyrl.backends.skyrl_train.weight_sync.fp8 import (
+    SKYRL_BATCHED_MOE_FP8_PREFIX,
+    batched_moe_wire_targets,
+)
+from skyrl.backends.skyrl_train.weight_sync.nvfp4_stacked import NVFP4_STACKED_PREFIX
+from skyrl.backends.skyrl_train.weight_sync.sharded_rdt.rdt_libfabric_shim import (
+    ensure_ray_rdt_libfabric,
+)
+
+ensure_ray_rdt_libfabric()
+
+if TYPE_CHECKING:
+    from vllm.config import ModelConfig, VllmConfig
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+# Must run inside EVERY vLLM worker process: post-sync hooks in the receive
+# engines need the process-local model runner, but vLLM only gives engines the
+# model object.
 try:
-    from vllm.model_executor.model_loader.reload.meta import (
-        SKIP_TENSORS as _VLLM_SKIP_TENSORS,
+    from skyrl.backends.skyrl_train.patches.vllm.patch_model_runner_registry import (
+        apply_model_runner_registry_patch,
     )
 
-    _VLLM_SKIP_TENSORS.add("conv_weights")
-except ImportError:
+    apply_model_runner_registry_patch()
+except ModuleNotFoundError as exc:
+    if exc.name != "vllm":
+        raise
+
+# Must run inside EVERY vLLM worker process: Worker.load_model builds the
+# weight-transfer engine through the factory. vLLM loads this module before model
+# init, which is what guarantees it. Guarded because this module is also imported
+# from processes without the optional deps.
+try:
+    # Lets WorkerLoRAManager build an adapter from tensors staged by the
+    # receive engine (lora.sync_mode=memory) instead of from a directory.
+    from skyrl.backends.skyrl_train.patches.vllm.patch_lora_in_memory import (
+        apply_lora_in_memory_patch,
+    )
+
+    apply_lora_in_memory_patch()
+except ModuleNotFoundError:
     pass
+
+# Apply the compatibility patches before vLLM constructs each worker.
+# Must be installed before the two KV-scale patches run: it is what tells them
+# whether this engine booted from dummy weights (serialized FP8 weight sync) or
+# from a real checkpoint whose calibrated scales they must not touch.
+patch_vllm_dummy_weight_boot_detection()
+patch_vllm_fp8_kv_scale_boot_normalization()
+patch_vllm_fp8_kv_scale_completion()
+patch_vllm_sleep_model_state()
+
+try:
+    from skyrl.backends.skyrl_train.weight_sync.register import (
+        register_receive_engines,
+    )
+
+    register_receive_engines()
+except ModuleNotFoundError:
+    logging.getLogger(__name__).debug(
+        "skyrl.weight_sync.register not importable; receive engines are unregistered "
+        "and any weight sync in this worker will fail at create_engine.",
+        exc_info=True,
+    )
+
+# vLLM's AOT compile artifact directory carries no device, so engines on
+# different GPUs can overwrite each other's artifact and die with "CUDA driver
+# error: invalid argument". Scope it to the running device. Installed here for
+# the same reason as the registrations above: this module is loaded in every
+# worker process before model init, and the device is read lazily at compile
+# time, once it is live.
+# TODO (sumanthrh): Remove the patch after https://github.com/vllm-project/vllm/pull/53312 lands.
+from skyrl.backends.skyrl_train.patches.vllm.patch_compile_cache_device_path import (  # noqa: E402
+    apply_compile_cache_device_path_patch,
+)
+
+apply_compile_cache_device_path_patch()
+
+# GLM-5.3-Flash LoRA: the pinned vLLM has no packed_modules_mapping for the model's fused
+# projections, and its merged-LoRA loader ignores the replicated_shard_ids that KDA's
+# in_proj_qkvbfg_a declares. Installed here for the same reason as the patch above: this
+# module is loaded in every worker process before model init.
+from skyrl.backends.skyrl_train.patches.vllm.patch_glm5next_lora_packing import (  # noqa: E402
+    apply_glm5next_lora_packing_patch,
+)
+
+apply_glm5next_lora_packing_patch()
+
+# MoE expert LoRA slots sized at the expert adapter rank (additional_config.max_expert_lora_rank).
+# Installed here for the same reason as the patches above: the slots are allocated at model init.
+from skyrl.backends.skyrl_train.patches.vllm.patch_moe_expert_lora_rank import (  # noqa: E402
+    apply_moe_expert_lora_rank_patch,
+)
+
+apply_moe_expert_lora_rank_patch()
+
+# Runs in every vLLM worker process before the model is loaded, so the
+# LoRA-capability declaration is in place for the supports_lora() gate.
+from skyrl.backends.skyrl_train.patches.vllm_kimi_k25_lora import (  # noqa: E402
+    apply_kimi_k25_lora_patch,
+)
+
+apply_kimi_k25_lora_patch()
+
+# Online fp8_per_block quantization hands the torch.compile'd per_block_cast_to_fp8 a vLLM
+# parameter subclass, which dynamo cannot trace (RecursionError on the first weight sync).
+from skyrl.backends.skyrl_train.patches.vllm.patch_per_block_fp8_param import (  # noqa: E402
+    apply_per_block_fp8_param_patch,
+)
+
+apply_per_block_fp8_param_patch()
+
+# Full-weight syncs go through vLLM's layerwise reload, which buffers each incoming tensor at
+# its unsharded size until the whole layer has arrived (~19 GiB per GLM-5.3 MoE layer on every
+# TP rank). Opt in to loading them into the local shard as they arrive instead.
+from skyrl.env_vars import SKYRL_VLLM_EAGER_LAYERWISE_RELOAD  # noqa: E402
+
+if SKYRL_VLLM_EAGER_LAYERWISE_RELOAD:
+    from skyrl.backends.skyrl_train.patches.vllm.patch_layerwise_reload_eager import (  # noqa: E402
+        apply_layerwise_reload_eager_patch,
+    )
+
+    apply_layerwise_reload_eager_patch()
+
+# R3 with inference PP > 1: relay each stage's routes to the next so the last stage returns every
+# layer (pass-through at PP=1; a no-op when vLLM relays natively).
+from skyrl.backends.skyrl_train.patches.vllm.patch_routed_experts_pp_relay import (  # noqa: E402
+    apply_pp_relay_worker_patch,
+)
+
+apply_pp_relay_worker_patch()
+
+# DeepSeek-V4 under layerwise reload (weight sync): run the model-level finalize once per reload, as
+# vllm-project/vllm#64357 (open) does upstream. TODO: remove once the pinned vLLM includes it.
+from skyrl.backends.skyrl_train.patches.vllm.patch_deepseek_v4_reload import (  # noqa: E402
+    apply_deepseek_v4_reload_patch,
+)
+
+apply_deepseek_v4_reload_patch()
+
+# A PP stage with no layers of some KV cache group gets cache tensors for layers it does not own (DeepSeek-V4.1 at PP=2).
+# TODO: remove once the pinned vLLM includes vllm-project/vllm#60234 (on main, not in 0.33.0).
+from skyrl.backends.skyrl_train.patches.vllm.patch_pp_kv_cache_projection import (  # noqa: E402
+    apply_pp_kv_cache_projection_patch,
+)
+
+apply_pp_kv_cache_projection_patch()
+
 
 VLLM_NEW_INFERENCE_WORKER_EXTENSION_CLS = f"{__name__}.NewInferenceWorkerWrap"
 
+# Checkpoint-name suffix -> (fused vLLM parameter suffix, FusedMoE shard id).
+# Fixed by vLLM's FusedMoE, so it is the same for every model.
+_BATCHED_MOE_TARGETS = batched_moe_wire_targets()
+
+
+def _map_hf_weight_name(model: torch.nn.Module, name: str) -> str:
+    """Apply a top-level vLLM model's HF-to-runtime prefix mapping."""
+    mapper = getattr(model, "hf_to_vllm_mapper", None)
+    if mapper is None:
+        return name
+    mapped = mapper.apply_list([name])
+    if len(mapped) != 1:
+        raise ValueError(f"Unable to map batched MoE checkpoint name {name!r}")
+    return mapped[0]
+
+
+def _load_batched_moe_fp8_tensor(
+    model: torch.nn.Module,
+    params_dict: dict[str, torch.nn.Parameter],
+    wire_name: str,
+    loaded_weight: torch.Tensor,
+) -> bool:
+    """Load one expert-batched FP8 weight or scale through FusedMoE's loader."""
+    if not wire_name.startswith(SKYRL_BATCHED_MOE_FP8_PREFIX):
+        return False
+    if loaded_weight.ndim != 3:
+        raise ValueError(
+            f"Batched MoE wire tensor must be 3D, got name={wire_name!r}, shape={tuple(loaded_weight.shape)}"
+        )
+
+    checkpoint_name = wire_name.removeprefix(SKYRL_BATCHED_MOE_FP8_PREFIX)
+    mapped_name = _map_hf_weight_name(model, checkpoint_name)
+    target_name = None
+    shard_id = None
+    for checkpoint_suffix, (target_suffix, candidate_shard_id) in _BATCHED_MOE_TARGETS.items():
+        if mapped_name.endswith(checkpoint_suffix):
+            target_name = mapped_name[: -len(checkpoint_suffix)] + target_suffix
+            shard_id = candidate_shard_id
+            break
+    if target_name is None or shard_id is None:
+        raise ValueError(f"Unsupported batched MoE wire tensor name {wire_name!r}")
+    if target_name not in params_dict:
+        module_path, _, param_leaf = target_name.rpartition(".")
+        nested_name = f"{module_path}.routed_experts.{param_leaf}"
+        if nested_name not in params_dict:
+            raise ValueError(
+                f"Batched MoE target parameter was not found for wire tensor {wire_name!r}: "
+                f"tried {target_name!r} and {nested_name!r}"
+            )
+        target_name = nested_name
+
+    param = params_dict[target_name]
+    weight_loader = getattr(param, "weight_loader", None)
+    if weight_loader is None or not getattr(weight_loader, "supports_moe_loading", False):
+        raise ValueError(f"Parameter {target_name!r} does not expose a FusedMoE weight loader")
+
+    if param.shape[0] == loaded_weight.shape[0]:
+        success = weight_loader(
+            param,
+            loaded_weight,
+            target_name,
+            shard_id=shard_id,
+            expert_id=0,
+            return_success=True,
+        )
+        if not success:
+            raise ValueError(f"Fused loading failed for batched MoE tensor {wire_name!r}")
+        return True
+
+    loaded_any = False
+    for expert_id, expert_weight in enumerate(loaded_weight.unbind(0)):
+        loaded_any = (
+            bool(
+                weight_loader(
+                    param,
+                    expert_weight,
+                    target_name,
+                    shard_id=shard_id,
+                    expert_id=expert_id,
+                    return_success=True,
+                )
+            )
+            or loaded_any
+        )
+    if not loaded_any:
+        raise ValueError(f"No local expert accepted batched MoE tensor {wire_name!r}")
+    return True
+
+
+def _load_checkpoint_weights(
+    model: torch.nn.Module,
+    weights: Iterable[tuple[str, torch.Tensor]],
+    nvfp4_stacked_receiver: Any = None,
+    **kwargs: Any,
+) -> Any:
+    """Load ordinary checkpoint tensors, compact batched-MoE FP8 tensors and stacked NVFP4 expert layers.
+
+    Stacked NVFP4 tensors (``weight_sync/nvfp4_stacked.py``) go to ``nvfp4_stacked_receiver``, which holds a
+    layer's tensors until all 8 have arrived (possibly across calls) and then loads the layer in one pass.
+    """
+    params_dict: dict[str, torch.nn.Parameter] | None = None
+    ordinary_weights: list[tuple[str, torch.Tensor]] = []
+    for name, weight in weights:
+        if name.startswith(SKYRL_BATCHED_MOE_FP8_PREFIX):
+            if params_dict is None:
+                params_dict = dict(model.named_parameters())
+            _load_batched_moe_fp8_tensor(model, params_dict, name, weight)
+        elif name.startswith(NVFP4_STACKED_PREFIX):
+            if nvfp4_stacked_receiver is None:
+                raise RuntimeError(f"Received stacked NVFP4 tensor {name!r} without a stacked receiver")
+            nvfp4_stacked_receiver.accept(name, weight)
+        else:
+            ordinary_weights.append((name, weight))
+    if nvfp4_stacked_receiver is not None:
+        nvfp4_stacked_receiver.end_of_batch()
+    if ordinary_weights:
+        return model.load_weights(weights=ordinary_weights, **kwargs)
+    return set()
+
 
 class NewInferenceWorkerWrap:
-    """
-    vLLM worker extension for chunked weight sync (new inference path).
+    """The weight-sync methods that must live on the worker, not an engine.
 
-    Provides a three-phase weight update protocol via collective_rpc:
-        1. start_weight_update: Prepare model for receiving weights
-        2. update_weights_chunk: Receive and load one chunk of weights
-        3. finish_weight_update: Finalize the model after all chunks
-
-    Attributes accessed from the host GPUWorker (via mixin inheritance):
-        self.weight_transfer_engine
-        self.model_runner
-        self.model_config
-        self.device
+    Attributes come from the host GPUWorker: vLLM appends this class to
+    ``Worker.__bases__``.
     """
 
-    def start_weight_update(self, is_checkpoint_format: bool = True) -> None:
-        """
-        Prepare the model for a new weight update.
+    vllm_config: "VllmConfig"
+    model_runner: "GPUModelRunner"
+    model_config: "ModelConfig"
+    device: torch.device
 
-        For checkpoint-format weights, initializes the layerwise reload
-        machinery which moves layers to meta device and wraps weight loaders
-        to defer processing until all weights for each layer are loaded.
-
-        Must be called before any update_weights_chunk calls.
-
-        Args:
-            is_checkpoint_format: True if incoming weights are in checkpoint
-                format (need layerwise processing). False if weights are
-                already in kernel format (direct copy).
-        """
-        if getattr(self, "_skyrl_weight_update_active", False):
-            raise RuntimeError(
-                "start_weight_update called while a weight update is "
-                "already active. Call finish_weight_update first."
-            )
-
-        if is_checkpoint_format:
-            from vllm.config import set_current_vllm_config
-            from vllm.model_executor.model_loader.reload import (
-                initialize_layerwise_reload,
-            )
-
-            model = self.model_runner.model
-            with set_current_vllm_config(self.vllm_config), torch.device(self.device):
-                initialize_layerwise_reload(model)
-
-        self._skyrl_is_checkpoint_format = is_checkpoint_format
-        self._skyrl_weight_update_active = True
-
-    def update_weights_chunk(self, update_info: dict) -> None:
-        """
-        Receive and load a single chunk of weights.
-
-        SkyRL packs each chunk's tensors into a single contiguous CUDA buffer and sends
-        one IPC handle per rank plus per-param `sizes` metadata. We rebuild
-        the packed tensor here, slice it per param, and hand the list to
-        model.load_weights (checkpoint format) or copy per-param directly
-        (kernel format).
-
-        Args:
-            update_info: Dict with keys:
-                - names: list[str]
-                - dtype_names: list[str]
-                - shapes: list[list[int]]
-                - sizes: list[int]  (element count per param; used for slicing)
-                - ipc_handles_pickled: b64(pickle({gpu_uuid: (func, args)}))
-        """
-        if not getattr(self, "_skyrl_weight_update_active", False):
-            raise RuntimeError("start_weight_update must be called before update_weights_chunk.")
-
+    def fetch_weights(self, target_version: int, sync_dir: str | None = None, uri: str | None = None):
+        """Fetch/apply a checkpoint delta before the paused reload phase."""
         if self.weight_transfer_engine is None:
+            raise RuntimeError("Weight transfer not configured: set weight_transfer_config on the engine.")
+        fetch = getattr(self.weight_transfer_engine, "fetch_weights", None)
+        if fetch is None:
+            raise RuntimeError(f"{type(self.weight_transfer_engine).__name__} does not support fetch_weights")
+        return fetch(target_version=target_version, sync_dir=sync_dir, uri=uri)
+
+    def skyrl_set_lora_receive_target(self, receive_target: dict) -> None:
+        """Arm the next weight update to build a LoRA adapter, not the base model.
+
+        Called on every worker over ``/collective_rpc`` just before the trainer
+        runs ``send_weights()``. The arming lasts exactly one round; the engine
+        disarms itself at ``finish_weight_update``.
+        """
+        engine = self.weight_transfer_engine
+        if engine is None:
+            raise RuntimeError("Weight transfer not configured: set weight_transfer_config on the engine.")
+        arm = getattr(engine, "skyrl_set_lora_receive_target", None)
+        if arm is None:
             raise RuntimeError(
-                "Weight transfer not configured. " "Please set weight_transfer_config to enable weight transfer."
+                f"{type(engine).__name__} cannot receive a LoRA adapter. "
+                "lora.sync_mode='memory' requires the skyrl_nccl or skyrl_ipc backend."
             )
+        arm(receive_target)
 
-        # --- unpack SkyRL packed CUDA IPC format ---
-        import base64
-        import pickle
+    def skyrl_param_digest(self) -> dict:
+        """Diagnostic: ``{name: "shape|dtype|blake2b"}`` over every parameter and buffer of the live model.
 
-        names = update_info["names"]
-        shapes = update_info["shapes"]
-        sizes = update_info["sizes"]
-        pickled = update_info["ipc_handles_pickled"]
-        handles = pickle.loads(base64.b64decode(pickled))
-
-        device_index = torch.cuda.current_device()
-        physical_gpu_id = str(torch.cuda.get_device_properties(device_index).uuid)
-        if physical_gpu_id not in handles:
-            raise ValueError(f"IPC handle not found for GPU UUID {physical_gpu_id}. " f"Available: {list(handles)}")
-        func, args = handles[physical_gpu_id]
-        # Remap device index to the LOCAL current-device.
-        list_args = list(args)
-        list_args[6] = device_index
-        packed_tensor = func(*list_args)
-
-        weights: list[tuple[str, torch.Tensor]] = []
-        offset = 0
-        for name, shape, size in zip(names, shapes, sizes):
-            weights.append((name, packed_tensor[offset : offset + size].view(*shape)))
-            offset += size
-
-        # process_weights_after_loading reads get_current_vllm_config() (e.g.
-        # flashinfer_cutlass_moe needs the compilation config to build kernels),
-        # and vllm only sets that context around init_device / load_model.
-        from vllm.config import set_current_vllm_config
+        Used to check that two weight-sync paths leave bitwise the same model on the sampler. Copies each tensor to host to hash it; seconds per GB, not for training loops.
+        """
+        import hashlib
+        import itertools
 
         model = self.model_runner.model
-        with set_current_vllm_config(self.vllm_config), torch.device(self.device):
-            if self._skyrl_is_checkpoint_format:
-                model.load_weights(weights=weights)
-            else:
-                for name, weight in weights:
-                    param = model.get_parameter(name)
-                    param.copy_(weight)
+        out = {}
+        for name, tensor in itertools.chain(model.named_parameters(), model.named_buffers()):
+            data = tensor.detach().contiguous().reshape(-1)
+            digest = hashlib.blake2b(digest_size=16)
+            if data.numel():
+                digest.update(memoryview(data.view(torch.uint8).cpu().numpy()))
+            out[name] = f"{tuple(tensor.shape)}|{tensor.dtype}|{digest.hexdigest()}"
+        return out
 
-        # Ensure consumption of packed_tensor finishes before we return (and
-        # before the sender drops its reference on the next barrier).
-        torch.accelerator.synchronize()
+    def skyrl_discard_in_memory_lora(self, lora_name: str) -> bool:
+        """Free the staged tensors of an unloaded in-memory adapter.
 
-    def finish_weight_update(self) -> None:
+        Not routed through the engine: the staging registry is per worker
+        *process* (it outlives any one update round, so vLLM can rebuild the
+        adapter after an LRU eviction), and an unload can arrive when no weight
+        transfer is configured at all.
         """
-        Finalize the current weight update.
+        from skyrl.backends.skyrl_train.patches.vllm.patch_lora_in_memory import (
+            discard_in_memory_adapter,
+        )
 
-        For checkpoint-format weights, runs layerwise postprocessing
-        (quantization repacking, attention weight processing, etc.).
-        Must be called after all update_weights_chunk calls are done.
+        return discard_in_memory_adapter(lora_name)
+
+    # Suspend / resume for non-colocated weight sync.
+    #
+    # Drives the per-worker CuMemAllocator directly instead of GPUWorker.sleep/
+    # wake_up, which is only reachable via EngineCore.sleep and force-clears the
+    # prefix cache and preempts running requests at level >= 1. Touching the
+    # allocator alone lets the caller hold a KEEP pause across the sync and
+    # resume frozen requests with their KV at the same virtual addresses -- no
+    # abort, no prefill recompute. Mirrors GPUWorker.sleep/wake_up; re-verify on
+    # vLLM bumps.
+
+    def skyrl_sleep_for_weight_sync(self, offload_kv: bool = True, offload_weights: bool = False) -> None:
+        """Free GPU memory for weight sync by sleeping the allocator.
+
+        By default, weights are discarded rather than backed up since the broadcast
+        overwrites every parameter on wake. ``offload_weights=True`` offloads them to
+        CPU instead: a LoRA adapter sync does not send the base model again, so the
+        wake must restore it. ``offload_kv`` controls whether the KV cache is
+        offloaded to CPU (preserved for frozen in-flight requests) or discarded. Model
+        buffers live in the weights pool but are not sent by the broadcast (e.g.
+        non-persistent rotary ``inv_freq``), so save them here and restore on
+        wake -- as GPUWorker.sleep(level=2) does.
+
+        The drafter's buffers are saved too: the weight sync reloads its
+        parameters, but nothing else restores its buffers.
+
+        Since vLLM 0.32.0, KV-init runtime state and CUDA graph memory live in their
+        own ``runtime`` / ``cudagraph`` pools. They are always offloaded (as in
+        CuMemBackend.suspend), since any wake remaps them and discarding them leaves
+        the next forward reading garbage (illegal memory access).
         """
-        if not getattr(self, "_skyrl_weight_update_active", False):
-            raise RuntimeError("start_weight_update must be called before finish_weight_update.")
+        from vllm.device_allocator import get_mem_allocator_instance
 
-        if self._skyrl_is_checkpoint_format:
-            from vllm.config import set_current_vllm_config
-            from vllm.model_executor.model_loader.reload import (
-                finalize_layerwise_reload,
-            )
+        self._skyrl_saved_buffers = {name: buf.cpu().clone() for name, buf in self.model_runner.model.named_buffers()}
+        draft = self._skyrl_draft_model()
+        self._skyrl_saved_draft_buffers = (
+            {name: buf.cpu().clone() for name, buf in draft.named_buffers()} if draft is not None else {}
+        )
+        self._skyrl_saved_model_state = save_model_state_tensors(self.model_runner)
+        offload_tags = ("runtime", "cudagraph", "kv_cache") if offload_kv else ("runtime", "cudagraph")
+        if offload_weights:
+            offload_tags += ("weights",)
+        get_mem_allocator_instance().sleep(offload_tags=offload_tags)
 
-            model = self.model_runner.model
-            with set_current_vllm_config(self.vllm_config), torch.device(self.device):
-                finalize_layerwise_reload(model, self.model_config)
+    def skyrl_wake_for_weight_sync(self, tags: list) -> None:
+        """Wake the given allocator tags, restoring CPU-backed contents.
 
-        self._skyrl_weight_update_active = False
-        self._skyrl_is_checkpoint_format = True
+        Call ``["weights"]`` before the broadcast and ``["kv_cache"]`` after. Does
+        not resume the scheduler; the caller does that via ``/resume``.
+        """
+        from vllm.device_allocator import get_mem_allocator_instance
+
+        # Return the broadcast's reserved-but-unallocated blocks to CUDA so cumem can
+        # remap the KV pool at its fixed virtual addresses.
+        torch.cuda.empty_cache()
+
+        get_mem_allocator_instance().wake_up(tags)
+        # Restore buffers (not covered by the broadcast) once weights remap.
+        if tags is None or "weights" in tags:
+            self._skyrl_restore_buffers(self.model_runner.model, "_skyrl_saved_buffers")
+            draft = self._skyrl_draft_model()
+            if draft is not None:
+                self._skyrl_restore_buffers(draft, "_skyrl_saved_draft_buffers")
+            restore_model_state_tensors(self.model_runner, getattr(self, "_skyrl_saved_model_state", {}))
+            self._skyrl_saved_model_state = {}
+        # Re-assert the serialized-FP8 KV scales after the KV pool remaps (no-op
+        # without fp8 KV cache or on a real-checkpoint boot). This path skips
+        # Worker.wake_up, so the vllm_compat wake patch never sees it.
+        if tags is None or "kv_cache" in tags:
+            normalize_fp8_kv_scales_after_wake(self.model_runner)
+
+    def _skyrl_draft_model(self):
+        """The spec-decode drafter module, or None when there is no drafter."""
+        get_draft_model = getattr(self.model_runner, "get_draft_model", None)
+        return get_draft_model() if callable(get_draft_model) else None
+
+    def _skyrl_restore_buffers(self, module, attr: str) -> None:
+        saved = getattr(self, attr, None)
+        if not saved:
+            return
+        for name, buf in module.named_buffers():
+            if name in saved:
+                buf.data.copy_(saved[name].data)
+        setattr(self, attr, {})

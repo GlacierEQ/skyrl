@@ -1,6 +1,7 @@
 """Tests for RemoteInferenceClient."""
 
 import asyncio
+import json
 import pickle
 import threading
 import time
@@ -8,18 +9,65 @@ from typing import Dict, List, Optional
 
 import aiohttp
 import httpx
+import numpy as np
+import orjson
 import pytest
 import pytest_asyncio
+import ray
 import uvicorn
 from fastapi import FastAPI, Query, Request
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import (
+    JSONResponse,
+    PlainTextResponse,
+    Response,
+    StreamingResponse,
+)
 
+from skyrl.backends.skyrl_train.inference_servers import (
+    remote_inference_client as remote_client_module,
+)
 from skyrl.backends.skyrl_train.inference_servers.common import get_open_port
+from skyrl.backends.skyrl_train.inference_servers.generate_wire import (
+    PackedArrayKey,
+    PackedField,
+    decode_packed_routed_experts,
+    decode_packed_sample_support,
+    pack_routed_experts,
+    pack_sample_support,
+)
 from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
     SKYRL_LORA_ADAPTER_NAME,
+    InferenceServerHTTPError,
+    InferenceServerTimeoutError,
     PauseMode,
+    RemoteGenerateClient,
     RemoteInferenceClient,
 )
+from skyrl.backends.skyrl_train.inference_servers.setup import (
+    build_new_inference_client,
+)
+from skyrl.train.config import SkyRLTrainConfig
+from tests.backends.skyrl_train.sample_support_helpers import csr, dense
+
+_ROUTES = np.arange(12).reshape(3, 2, 2)
+
+
+async def _fake_detokenize(token_id_lists: List[List[int]]) -> List[str]:
+    return ["text"] * len(token_id_lists)
+
+
+_SUPPORT = csr([[7, 8, -1], [-1, -1, -1], [9, 10, 11]])
+
+
+def _packed_generate_body(*, two_blobs: bool) -> dict:
+    choice: dict = {
+        "token_ids": [1, 2, 3],
+        "finish_reason": "stop",
+        PackedField.ROUTED_EXPERTS.value: pack_routed_experts(_ROUTES),
+    }
+    if two_blobs:
+        choice[PackedField.ROLLOUT_SAMPLE_SUPPORT.value] = pack_sample_support(_SUPPORT)
+    return {"choices": [choice]}
 
 
 def create_mock_vllm_server(server_id: int) -> FastAPI:
@@ -27,19 +75,101 @@ def create_mock_vllm_server(server_id: int) -> FastAPI:
     app = FastAPI()
     app.state.last_generate_features = None
     app.state.last_generate_model = None
+    app.state.last_generate_sampling_params = None
     app.state.last_chat_model = None
     app.state.last_completion_model = None
     app.state.last_render_model = None
     # Per-server LoRA registry: lora_name -> lora_path
     app.state.lora_registry = {}
+    app.state.fetch_weights_requests = []
+    # Session ids received via /finish_session, in arrival order.
+    app.state.finished_sessions = []
+    # Number of /get_world_size hits, used to assert client-side caching.
+    app.state.world_size_calls = 0
+    app.state.drifted_body_calls = 0
+    app.state.flaky_body_calls = 0
 
     @app.get("/health")
     async def health():
         return {"status": "ok"}
 
+    @app.post("/test/packed_body")
+    async def packed_body(two_blobs: bool = False):
+        return Response(content=orjson.dumps(_packed_generate_body(two_blobs=two_blobs)), media_type="application/json")
+
+    @app.post("/test/drifted_packed_body")
+    async def drifted_packed_body():
+        app.state.drifted_body_calls += 1
+        # stdlib json spaces its separators, so the splice prefix no longer matches.
+        content = json.dumps(_packed_generate_body(two_blobs=False)).encode()
+        return Response(content=content, media_type="application/json")
+
+    @app.post("/test/flaky_packed_body")
+    async def flaky_packed_body():
+        app.state.flaky_body_calls += 1
+        if app.state.flaky_body_calls == 1:
+            return Response(content=b"<html>gateway hiccup</html>", media_type="application/json", status_code=502)
+        return Response(content=orjson.dumps(_packed_generate_body(two_blobs=True)), media_type="application/json")
+
+    @app.post("/test/reset_packed_body_calls")
+    async def reset_packed_body_calls():
+        app.state.drifted_body_calls = 0
+        app.state.flaky_body_calls = 0
+        return {"status": "ok"}
+
+    @app.get("/test/packed_body_calls")
+    async def packed_body_calls():
+        return {"drifted": app.state.drifted_body_calls, "flaky": app.state.flaky_body_calls}
+
+    @app.post("/test/bad_request_text")
+    async def bad_request_text():
+        return PlainTextResponse("prompt too long", status_code=400)
+
+    @app.post("/test/control_body")
+    async def control_body(kind: str, chunked: bool, status: int = 200):
+        body = {
+            "json": b'{"success": true}',
+            "empty": b"",
+            "invalid": b"not-json",
+            "error": b'{"error": {"message": "reset unavailable"}}',
+        }[kind]
+        if chunked:
+            return StreamingResponse(iter([body]), media_type="application/json", status_code=status)
+        return Response(body, media_type="application/json", status_code=status)
+
+    @app.post("/test/control_hang")
+    async def control_hang():
+        await asyncio.sleep(30)
+        return {"status": "ok"}
+
+    @app.post("/test/control_plain_error")
+    async def control_plain_error():
+        return PlainTextResponse("engine is dead", status_code=502)
+
+    @app.post("/test/control_json_array_error")
+    async def control_json_array_error():
+        return JSONResponse(["engine is dead"], status_code=502)
+
+    @app.post("/test/control_malformed_json_error")
+    async def control_malformed_json_error():
+        return Response(content="<html>bad gateway</html>", media_type="application/json", status_code=502)
+
+    @app.post("/finish_session")
+    async def finish_session(session_id: str = Query(...)):
+        app.state.finished_sessions.append(session_id)
+        return {"status": "ok", "session_id": session_id}
+
+    @app.get("/test/finished")
+    async def get_finished():
+        return {"finished": list(app.state.finished_sessions)}
+
     @app.get("/test/last_generate_features")
     async def get_last_generate_features():
         return {"features": app.state.last_generate_features}
+
+    @app.get("/test/last_generate_sampling_params")
+    async def get_last_generate_sampling_params():
+        return app.state.last_generate_sampling_params
 
     @app.get("/test/last_models")
     async def get_last_models():
@@ -56,7 +186,12 @@ def create_mock_vllm_server(server_id: int) -> FastAPI:
 
     @app.get("/get_world_size")
     async def get_world_size():
+        app.state.world_size_calls += 1
         return {"world_size": 2}  # Simulate TP=2
+
+    @app.get("/test/world_size_calls")
+    async def get_world_size_calls():
+        return {"count": app.state.world_size_calls}
 
     @app.post("/v1/completions")
     async def completions(request: Request):
@@ -77,6 +212,7 @@ def create_mock_vllm_server(server_id: int) -> FastAPI:
     async def generate(request: Request):
         body = await request.json()  # Consume body
         sp = body.get("sampling_params", {})
+        app.state.last_generate_sampling_params = sp
         input_token_ids = body.get("token_ids", [])
         app.state.last_generate_model = body.get("model")
         n = sp.get("n", 1)
@@ -98,6 +234,9 @@ def create_mock_vllm_server(server_id: int) -> FastAPI:
                 for i in range(num_choices)
             ]
         }
+        if request.url.path == "/skyrl/v1/generate":
+            routes = np.arange(12).reshape(3, 2, 2)
+            response["choices"][0]["routed_experts"] = pack_routed_experts(routes)
 
         features = body.get("features")
         app.state.last_generate_features = features
@@ -216,25 +355,35 @@ def create_mock_vllm_server(server_id: int) -> FastAPI:
         # Mock always returns not paused for basic tests
         return {"is_paused": False}
 
+    @app.get("/is_sleeping")
+    async def is_sleeping():
+        return {"is_sleeping": False}
+
     @app.post("/sleep")
-    async def sleep(level: int = 2, tags: Optional[List[str]] = Query(None)):
-        return {"status": "sleeping", "server_id": server_id, "level": level, "tags": tags}
+    async def sleep(level: int = 2, mode: str = "abort", tags: Optional[List[str]] = Query(None)):
+        return {"status": "sleeping", "server_id": server_id, "level": level, "mode": mode, "tags": tags}
 
     @app.post("/wake_up")
     async def wake_up(tags: Optional[List[str]] = Query(None)):
         return {"status": "awake", "server_id": server_id, "tags": tags}
 
     @app.post("/reset_prefix_cache")
-    async def reset_prefix_cache(request: Request):
-        return {"status": "cache_reset", "server_id": server_id}
+    async def reset_prefix_cache(reset_running_requests: bool = Query(False)):
+        return {"success": True, "reset_running_requests": reset_running_requests}
 
     @app.post("/init_weight_transfer_engine")
     async def init_weight_transfer_engine(request: Request):
-        return {"status": "ok", "server_id": server_id}
+        return {"status": "ok", "server_id": server_id, "body": await request.json()}
 
     @app.post("/update_weights")
     async def update_weights(request: Request):
-        return {"status": "ok", "server_id": server_id}
+        return {"status": "ok", "server_id": server_id, "body": await request.json()}
+
+    @app.post("/fetch_weights")
+    async def fetch_weights(request: Request):
+        body = await request.json()
+        app.state.fetch_weights_requests.append(body)
+        return {"status": "ok", "server_id": server_id, "body": body}
 
     @app.post("/skyrl/v1/load_lora_adapter")
     async def load_lora_adapter(request: Request):
@@ -266,6 +415,32 @@ def create_mock_vllm_server(server_id: int) -> FastAPI:
         return PlainTextResponse(f"Success: LoRA adapter '{lora_name}' removed successfully on server {server_id}.")
 
     return app
+
+
+@pytest.mark.asyncio
+async def test_build_new_inference_client_uses_served_model_name_for_chat_requests(mock_servers):
+    cfg = SkyRLTrainConfig()
+    cfg.trainer.policy.model.path = "Qwen/Qwen2.5-1.5B-Instruct"
+    cfg.generator.inference_engine.served_model_name = "served-alias"
+    cfg.generator.inference_engine.external_proxy_url = mock_servers["proxy_url"]
+    cfg.generator.inference_engine.external_server_urls = mock_servers["server_urls"]
+
+    client, server_setup = build_new_inference_client(cfg, tokenizer=None)
+
+    try:
+        assert server_setup.proxy_url == mock_servers["proxy_url"]
+        assert server_setup.server_urls == mock_servers["server_urls"]
+
+        await client.chat_completion(
+            {
+                "json": {"messages": [{"role": "user", "content": "hi"}]},
+                "headers": {},
+            }
+        )
+        captured = await _get_last_models(mock_servers["server_urls"])
+        assert captured[0]["chat"] == "served-alias"
+    finally:
+        await client.teardown()
 
 
 def start_server(port: int, server_id: int) -> uvicorn.Server:
@@ -327,6 +502,94 @@ async def client(mock_servers):
     await client.teardown()
 
 
+def _start_finish_session_error_server(port: int) -> uvicorn.Server:
+    """Start a mock router whose /finish_session always returns HTTP 500."""
+    app = FastAPI()
+
+    @app.get("/health")
+    async def health():
+        return {"status": "ok"}
+
+    @app.post("/finish_session")
+    async def finish_session(session_id: str = Query(...)):
+        return JSONResponse(status_code=500, content={"error": "boom"})
+
+    config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="error")
+    server = uvicorn.Server(config)
+    threading.Thread(target=lambda: asyncio.run(server.serve()), daemon=True).start()
+    return server
+
+
+@pytest.fixture(scope="module")
+def error_router():
+    """A router URL whose /finish_session always errors with HTTP 500."""
+    port = get_open_port()
+    server = _start_finish_session_error_server(port)
+    url = f"http://127.0.0.1:{port}"
+    assert wait_ready(url), "error router failed to start"
+    yield url
+    server.should_exit = True
+    time.sleep(0.2)
+
+
+def _assert_picklable_http_error(exc: BaseException, *, status: int, message: str) -> None:
+    assert isinstance(exc, InferenceServerHTTPError)
+    restored = pickle.loads(pickle.dumps(exc))
+    assert type(restored) is InferenceServerHTTPError
+    assert (restored.status, restored.message, str(restored)) == (status, message, str(exc))
+
+
+class TestInferenceServerHTTPError:
+    """aiohttp's ClientResponseError can't be pickled, so Ray would replace it with a bare RayError."""
+
+    def test_survives_a_ray_task(self):
+        @ray.remote
+        def fail():
+            exc = InferenceServerHTTPError("POST", "http://127.0.0.1:1/pause", 503, "overloaded", [("X-A", "1")])
+            exc.add_note("while pausing")
+            raise exc
+
+        with pytest.raises(InferenceServerHTTPError) as exc_info:
+            ray.get(fail.remote())
+        assert exc_info.value.status == 503
+        assert exc_info.value.message == "overloaded"
+        assert exc_info.value.request_info.method == "POST"
+        assert exc_info.value.headers["X-A"] == "1"
+        assert "while pausing" in str(exc_info.value)
+
+    @pytest.mark.parametrize(
+        "endpoint,message",
+        [
+            ("/test/control_plain_error", "engine is dead"),
+            ("/test/control_json_array_error", "Bad Gateway"),
+            ("/test/control_malformed_json_error", "<html>bad gateway</html>"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_control_plane_error_body(self, client, mock_servers, endpoint, message):
+        with pytest.raises(InferenceServerHTTPError) as exc_info:
+            await client._call_server(mock_servers["server_urls"][0], endpoint)
+        _assert_picklable_http_error(exc_info.value, status=502, message=message)
+
+
+class TestControlPlaneTimeout:
+    @pytest.mark.asyncio
+    async def test_hung_control_plane_call_raises_picklable_timeout(self, client, mock_servers, monkeypatch):
+        monkeypatch.setattr(remote_client_module, "SKYRL_INFERENCE_CONTROL_PLANE_TIMEOUT_S", 0.2)
+        url = mock_servers["server_urls"][0]
+        with pytest.raises(InferenceServerTimeoutError) as exc_info:
+            await asyncio.wait_for(client._call_server(url, "/test/control_hang"), timeout=10)
+        err = exc_info.value
+        assert (err.method, err.url, err.timeout_s) == ("POST", f"{url}/test/control_hang", 0.2)
+        restored = pickle.loads(pickle.dumps(err))
+        assert (restored.method, restored.url, restored.timeout_s, str(restored)) == (
+            err.method,
+            err.url,
+            err.timeout_s,
+            str(err),
+        )
+
+
 class TestRemoteInferenceClientInit:
     """Test client initialization and serialization."""
 
@@ -339,6 +602,10 @@ class TestRemoteInferenceClientInit:
             data_parallel_size=1,
         )
 
+        # Materialize the generate client so the assertion below actually exercises
+        # __getstate__ dropping it, rather than passing because it was never created.
+        assert client._get_generate_client() is not None
+
         # Pickle and unpickle
         pickled = pickle.dumps(client)
         restored = pickle.loads(pickled)
@@ -346,8 +613,8 @@ class TestRemoteInferenceClientInit:
         assert restored.proxy_url == client.proxy_url
         assert restored.server_urls == client.server_urls
         assert restored.model_name == client.model_name
-        # Session should be None after unpickling
-        assert restored._session is None
+        # No sessions should survive unpickling
+        assert restored._generate_client is None
 
 
 class TestDataPlane:
@@ -378,6 +645,136 @@ class TestDataPlane:
         }
         result = await client.generate(input_batch)
         assert len(result["responses"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_generate_decodes_packed_routed_experts(self, mock_servers):
+        client = RemoteInferenceClient(
+            proxy_url=mock_servers["proxy_url"],
+            server_urls=mock_servers["server_urls"],
+            data_parallel_size=1,
+            enable_return_routed_experts=True,
+        )
+        try:
+            result = await client.generate({"prompt_token_ids": [[1, 2, 3]], "routed_experts_prompt_starts": [1]})
+            async with httpx.AsyncClient() as http:
+                captured = (await http.get(f"{mock_servers['proxy_url']}/test/last_generate_sampling_params")).json()
+        finally:
+            await client.teardown()
+
+        assert len(result["rollout_expert_indices"]) == 1
+        assert result["rollout_expert_indices"][0].dtype == np.uint8
+        assert np.array_equal(result["rollout_expert_indices"][0], np.arange(12).reshape(3, 2, 2))
+        assert captured["routed_experts_prompt_start"] == 1
+
+    @pytest.mark.asyncio
+    async def test_external_generator_requests_sample_support(self, monkeypatch):
+        generate_client = RemoteGenerateClient(proxy_url="http://unused")
+        captured = {}
+
+        async def fake_post(url, json, headers, *, packed_side_channels=False):
+            captured.update(url=url, json=json, headers=headers, packed_side_channels=packed_side_channels)
+            return {
+                "choices": [
+                    {
+                        "token_ids": [7],
+                        "finish_reason": "stop",
+                        "logprobs": {"content": [{"logprob": -0.1}]},
+                        PackedField.ROLLOUT_SAMPLE_SUPPORT.value: pack_sample_support(csr([[7, 8]])),
+                    }
+                ]
+            }
+
+        monkeypatch.setattr(generate_client, "_post", fake_post)
+        result = await generate_client.generate(
+            prompt_token_ids=[1, 2],
+            sampling_params={},
+            session_id=None,
+            model="default",
+            return_sample_support=True,
+        )
+
+        assert captured["url"].endswith("/skyrl/v1/generate")
+        assert captured["json"]["return_sample_support"] is True
+        assert captured["packed_side_channels"] is True
+        assert np.array_equal(dense(result.sample_support), [[7, 8]])
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("input_batch_opts", [{}, {"return_sample_support": False}])
+    async def test_sample_support_capture_is_opt_in_per_request(self, monkeypatch, input_batch_opts):
+        client = RemoteInferenceClient(
+            proxy_url="http://unused",
+            server_urls=["http://unused"],
+            data_parallel_size=1,
+            enable_return_sample_support_set=True,
+        )
+        captured = {}
+
+        async def fake_post(url, json, headers, *, packed_side_channels=False):
+            captured.update(url=url, json=json)
+            return {"choices": [{"token_ids": [1], "finish_reason": "stop"}]}
+
+        monkeypatch.setattr(client._get_generate_client(), "_post", fake_post)
+        monkeypatch.setattr(client, "detokenize", _fake_detokenize)
+
+        result = await client.generate({"prompt_token_ids": [[1, 2]], **input_batch_opts})
+
+        assert "return_sample_support" not in captured["json"]
+        assert captured["url"].endswith("/inference/v1/generate")
+        assert result["rollout_sample_support"] is None
+
+    @pytest.mark.asyncio
+    async def test_sample_support_capture_honours_an_explicit_opt_in(self, monkeypatch):
+        client = RemoteInferenceClient(
+            proxy_url="http://unused",
+            server_urls=["http://unused"],
+            data_parallel_size=1,
+            enable_return_sample_support_set=True,
+        )
+        captured = {}
+
+        async def fake_post(url, json, headers, *, packed_side_channels=False):
+            captured.update(url=url, json=json)
+            return {
+                "choices": [
+                    {
+                        "token_ids": [7],
+                        "finish_reason": "stop",
+                        PackedField.ROLLOUT_SAMPLE_SUPPORT.value: pack_sample_support(csr([[7, 8]])),
+                    }
+                ]
+            }
+
+        monkeypatch.setattr(client._get_generate_client(), "_post", fake_post)
+        monkeypatch.setattr(client, "detokenize", _fake_detokenize)
+
+        result = await client.generate({"prompt_token_ids": [[1, 2]], "return_sample_support": True})
+
+        assert captured["json"]["return_sample_support"] is True
+        assert np.array_equal(dense(result["rollout_sample_support"][0]), [[7, 8]])
+
+    @pytest.mark.asyncio
+    async def test_generate_rejects_list_routed_experts(self, monkeypatch):
+        client = RemoteInferenceClient(
+            proxy_url="http://unused",
+            server_urls=["http://unused"],
+            data_parallel_size=1,
+            enable_return_routed_experts=True,
+        )
+
+        async def return_list_routes(*args, **kwargs):
+            return {
+                "choices": [
+                    {
+                        "token_ids": [1],
+                        "finish_reason": "stop",
+                        "routed_experts": [[[0, 1]]],
+                    }
+                ]
+            }
+
+        monkeypatch.setattr(client._get_generate_client(), "_post", return_list_routes)
+        with pytest.raises(ValueError, match="must return packed"):
+            await client._generate_single([1], {}, None, "model")
 
     @pytest.mark.asyncio
     async def test_chat_completion(self, client):
@@ -417,8 +814,130 @@ class TestDataPlane:
         assert result[0] == "hello world"  # Mock response
 
 
+class TestPackedSideChannelBodies:
+    """Tests for response parsing with packed side channels."""
+
+    async def _post_packed(self, client, mock_servers, path: str, **kwargs):
+        return await client._get_generate_client()._post(
+            f"{mock_servers['proxy_url']}{path}", json={}, packed_side_channels=True, **kwargs
+        )
+
+    @pytest.mark.asyncio
+    async def test_splices_both_registered_fields(self, client, mock_servers):
+        body = await self._post_packed(client, mock_servers, "/test/packed_body?two_blobs=true")
+        choice = body["choices"][0]
+
+        assert isinstance(choice[PackedField.ROUTED_EXPERTS][PackedArrayKey.DATA], memoryview)
+        assert isinstance(choice[PackedField.ROLLOUT_SAMPLE_SUPPORT][PackedArrayKey.DATA], memoryview)
+        assert np.array_equal(decode_packed_routed_experts(choice[PackedField.ROUTED_EXPERTS]), _ROUTES)
+        support = decode_packed_sample_support(choice[PackedField.ROLLOUT_SAMPLE_SUPPORT])
+        assert np.array_equal(dense(support), dense(_SUPPORT))
+
+    @pytest.mark.asyncio
+    async def test_drifted_layout_raises_without_retrying(self, client, mock_servers):
+        await client._post(f"{mock_servers['proxy_url']}/test/reset_packed_body_calls", json={})
+
+        with pytest.raises(ValueError, match="layout drifted"):
+            await self._post_packed(client, mock_servers, "/test/drifted_packed_body")
+
+        async with httpx.AsyncClient() as http:
+            counts = (await http.get(f"{mock_servers['proxy_url']}/test/packed_body_calls")).json()
+        assert counts["drifted"] == 1
+
+    @pytest.mark.asyncio
+    async def test_undecodable_body_is_retried_then_spliced(self, client, mock_servers):
+        await client._post(f"{mock_servers['proxy_url']}/test/reset_packed_body_calls", json={})
+
+        body = await self._post_packed(client, mock_servers, "/test/flaky_packed_body")
+
+        async with httpx.AsyncClient() as http:
+            counts = (await http.get(f"{mock_servers['proxy_url']}/test/packed_body_calls")).json()
+        assert counts["flaky"] == 2
+        assert np.array_equal(
+            decode_packed_routed_experts(body["choices"][0][PackedField.ROUTED_EXPERTS]),
+            _ROUTES,
+        )
+
+    @pytest.mark.asyncio
+    async def test_client_error_with_non_json_body_surfaces_the_text(self, client, mock_servers):
+        with pytest.raises(aiohttp.ClientResponseError, match="prompt too long") as exc_info:
+            await client._post(f"{mock_servers['proxy_url']}/test/bad_request_text", json={})
+        _assert_picklable_http_error(exc_info.value, status=400, message="prompt too long")
+
+    @pytest.mark.asyncio
+    async def test_non_routed_expert_generate_never_scans_the_body(self, client, monkeypatch):
+        def fail(*args, **kwargs):
+            raise AssertionError("the non-R3 path must not scan the response body")
+
+        monkeypatch.setattr(remote_client_module, "load_packed_body", fail)
+
+        result = await client.generate({"prompt_token_ids": [[1, 2, 3]]})
+        assert len(result["responses"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_routed_expert_generate_goes_through_the_splice(self, mock_servers, monkeypatch):
+        calls: List[int] = []
+        original = remote_client_module.load_packed_body
+
+        def counted(raw, **kwargs):
+            calls.append(len(raw))
+            return original(raw, **kwargs)
+
+        monkeypatch.setattr(remote_client_module, "load_packed_body", counted)
+        client = RemoteInferenceClient(
+            proxy_url=mock_servers["proxy_url"],
+            server_urls=mock_servers["server_urls"],
+            data_parallel_size=1,
+            enable_return_routed_experts=True,
+        )
+        try:
+            result = await client.generate({"prompt_token_ids": [[1, 2, 3]]})
+        finally:
+            await client.teardown()
+
+        assert len(calls) == 1
+        assert np.array_equal(result["rollout_expert_indices"][0], _ROUTES)
+
+
 class TestControlPlane:
     """Test control plane methods (fan-out to all servers)."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("chunked", [False, True])
+    @pytest.mark.parametrize("kind,expected", [("json", {"success": True}), ("empty", None)])
+    async def test_control_response_body(self, client, chunked, kind, expected):
+        url = client.server_urls[0]
+
+        result = await client._call_server(
+            url, "/test/control_body", params={"kind": kind, "chunked": str(chunked).lower()}
+        )
+
+        assert result == (url, {"status": 200, "body": expected})
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("chunked", [False, True])
+    async def test_control_response_invalid_json(self, client, chunked):
+        with pytest.raises(json.JSONDecodeError):
+            await client._call_server(
+                client.server_urls[0],
+                "/test/control_body",
+                params={"kind": "invalid", "chunked": str(chunked).lower()},
+            )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("chunked", [False, True])
+    @pytest.mark.parametrize("kind", ["error", "empty"])
+    async def test_control_response_http_error(self, client, chunked, kind):
+        with pytest.raises(aiohttp.ClientResponseError) as error:
+            await client._call_server(
+                client.server_urls[0],
+                "/test/control_body",
+                params={"kind": kind, "chunked": str(chunked).lower(), "status": 503},
+            )
+
+        assert error.value.status == 503
+        if kind == "error":
+            assert error.value.message == "reset unavailable"
 
     @pytest.mark.asyncio
     async def test_pause_keep_mode(self, client):
@@ -477,6 +996,9 @@ class TestControlPlane:
         assert len(result) == 2
         for url, response in result.items():
             assert response["body"]["level"] == 2
+            # In-flight requests are aborted by a separate /pause first, so /sleep itself
+            # pauses in "keep" mode (required by vLLM with routed-experts capture enabled).
+            assert response["body"]["mode"] == "keep"
             assert response["body"]["tags"] is None
 
     @pytest.mark.asyncio
@@ -487,6 +1009,11 @@ class TestControlPlane:
         for url, response in result.items():
             assert response["body"]["level"] == 1
             assert response["body"]["tags"] == ["weights", "kv_cache"]
+
+    @pytest.mark.asyncio
+    async def test_is_sleeping(self, client):
+        """Test is_sleeping fans out to all servers and unwraps response bodies."""
+        assert await client.is_sleeping() is False
 
     @pytest.mark.asyncio
     async def test_wake_up(self, client):
@@ -505,30 +1032,22 @@ class TestControlPlane:
             assert response["body"]["tags"] == ["weights"]
 
     @pytest.mark.asyncio
-    async def test_reset_prefix_cache(self, client):
-        """Test reset_prefix_cache fans out to all servers."""
-        result = await client.reset_prefix_cache()
-        assert len(result) == 2
+    @pytest.mark.parametrize("reset_running_requests", [False, True])
+    async def test_reset_prefix_cache(self, client, reset_running_requests):
+        """Reset uses vLLM's query parameter on every server."""
+        result = await client.reset_prefix_cache(reset_running_requests=reset_running_requests)
+        assert set(result) == set(client.server_urls)
+        for response in result.values():
+            assert response["body"] == {"success": True, "reset_running_requests": reset_running_requests}
 
 
 class TestWeightSync:
     """Test weight sync methods."""
 
-    @pytest.mark.asyncio
-    async def test_init_weight_update_communicator(self, client):
-        """Test init_weight_update_communicator expands init_info and fans out to all servers."""
-
-        class MockInitInfo:
-            """Lightweight mock satisfying the for_servers / to_api_payload protocol."""
-
-            def for_servers(self, world_size_per_server, num_servers, dp_size=1):
-                return [self] * num_servers
-
-            def to_api_payload(self):
-                return {"master_address": "127.0.0.1", "master_port": 29500, "rank_offset": 1, "world_size": 5}
-
-        result = await client.init_weight_update_communicator(MockInitInfo())
-        assert len(result) == 2
+    # The init handshake and the start/update/finish lifecycle run on the
+    # trainer-side engines' blocking SkyrlWeightSyncClient
+    # (weight_sync/control_plane.py, covered by test_control_plane.py). Covered
+    # here is what this client drives from the driver.
 
     @pytest.mark.asyncio
     async def test_update_named_weights(self, client):
@@ -540,7 +1059,25 @@ class TestWeightSync:
             "packed": True,
         }
         result = await client.update_named_weights(update_info)
+        assert set(result) == set(client.server_urls)
+        for response in result.values():
+            assert response["body"]["body"] == {"update_info": update_info}
+
+    @pytest.mark.asyncio
+    async def test_fetch_weights(self, client):
+        """Test fetch_weights fans out to /fetch_weights on all servers."""
+        result = await client.fetch_weights(
+            target_version=3,
+            sync_dir="gs://bucket/prefix",
+            uri="gs://bucket/prefix/delta-00000003",
+        )
         assert len(result) == 2
+        for response in result.values():
+            assert response["body"]["body"] == {
+                "target_version": 3,
+                "sync_dir": "gs://bucket/prefix",
+                "uri": "gs://bucket/prefix/delta-00000003",
+            }
 
 
 class TestServerInfo:
@@ -548,16 +1085,27 @@ class TestServerInfo:
 
     @pytest.mark.asyncio
     async def test_get_world_size(self, client):
-        """Test world_size fetching and caching."""
-        # First call fetches from all servers and sums
+        """world_size sums across servers and is cached after the first call."""
+
+        async def _total_server_calls():
+            counts = await client._call_all_servers("/test/world_size_calls", {}, method="GET")
+            return sum(response["body"]["count"] for response in counts.values())
+
+        before = await _total_server_calls()
+
+        # First call fetches from all servers and sums (each mock reports 2, 2 servers = 4).
         total_world_size, world_size_per_server = await client.get_world_size()
-        # Each mock server reports world_size=2, we have 2 servers = 4
         assert total_world_size == 4
         assert world_size_per_server == 2
+        after_first = await _total_server_calls()
+        # It queried every server exactly once.
+        assert after_first - before == len(client.server_urls)
 
-        # Second call returns cached value
+        # Second call is served from the client-side cache — no further server queries.
         total_world_size2, _ = await client.get_world_size()
         assert total_world_size2 == 4
+        after_second = await _total_server_calls()
+        assert after_second - after_first == 0
 
 
 class TestSample:
@@ -858,7 +1406,49 @@ class TestContextManager:
             assert len(result) == 2
 
         # Session should be closed after exiting context
-        assert client._session is None or client._session.closed
+        gen_client = client._generate_client
+        assert gen_client is None or all(session.closed for session in gen_client._sessions.values())
+
+
+class TestPerLoopSessions:
+    """HTTP sessions are bound to the event loop that created them."""
+
+    def test_sessions_are_isolated_per_loop(self):
+        client = RemoteInferenceClient(
+            proxy_url="http://localhost:1",
+            server_urls=["http://localhost:1"],
+            data_parallel_size=1,
+        )
+        # A persistent loop on its own thread, like the Tinker engine's continuous sampler.
+        loop = asyncio.new_event_loop()
+        thread = threading.Thread(target=loop.run_forever, daemon=True)
+        thread.start()
+
+        def on_persistent(coro):
+            return asyncio.run_coroutine_threadsafe(coro, loop).result(timeout=5)
+
+        try:
+            persistent = on_persistent(client._get_session())
+            # Sessions now live on the extracted generate client.
+            sessions = client._generate_client._sessions
+
+            # A transient loop (asyncio.run) gets its own session and leaves the persistent one open.
+            transient = asyncio.run(client._get_session())
+            assert transient is not persistent
+            assert not persistent.closed
+
+            # The persistent loop keeps reusing its session; the closed loop's entry is evicted.
+            assert on_persistent(client._get_session()) is persistent
+            assert list(sessions) == [loop]
+
+            # aclose() on the persistent loop closes only that loop's session.
+            on_persistent(client.aclose())
+            assert persistent.closed
+            assert sessions == {}
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=5)
+            loop.close()
 
 
 async def _get_lora_registries(server_urls: List[str]) -> List[Dict[str, str]]:
@@ -927,8 +1517,9 @@ class TestLoRAControlPlane:
     @pytest.mark.asyncio
     async def test_unload_unknown_lora_raises(self, client, mock_servers):
         # Server returns 404, surfaced as ClientResponseError via raise_for_status.
-        with pytest.raises(aiohttp.ClientResponseError):
+        with pytest.raises(aiohttp.ClientResponseError) as exc_info:
             await client.unload_lora_adapter("nonexistent-lora")
+        _assert_picklable_http_error(exc_info.value, status=404, message="Not Found")
         registries = await _get_lora_registries(mock_servers["server_urls"])
         for reg in registries:
             assert "nonexistent-lora" not in reg
@@ -1243,5 +1834,58 @@ class TestExplicitModelRequired:
             }
             with pytest.raises(ValueError, match="LoRA is enabled"):
                 await client.sample(request_payload)
+        finally:
+            await client.teardown()
+
+
+class TestFinishSession:
+    """Tests for ``RemoteInferenceClient.finish_session`` (router notification).
+
+    ``finish_session`` runs on cleanup paths (trajectory completion, error, or
+    cancellation), so it must POST the session id to the router and never raise.
+    """
+
+    @pytest.mark.asyncio
+    async def test_posts_session_id(self, client, mock_servers):
+        """The session id is POSTed to the router's /finish_session endpoint."""
+        await client.finish_session("traj-finish-1")
+        await client.finish_session("traj-finish-2")
+
+        finished = httpx.get(f"{mock_servers['proxy_url']}/test/finished", timeout=2.0).json()["finished"]
+        assert "traj-finish-1" in finished
+        assert "traj-finish-2" in finished
+
+    @pytest.mark.asyncio
+    async def test_empty_session_id_is_noop(self, client, mock_servers):
+        """Empty or None session ids are not sent to the router."""
+        before = httpx.get(f"{mock_servers['proxy_url']}/test/finished", timeout=2.0).json()["finished"]
+        await client.finish_session("")
+        await client.finish_session(None)
+        after = httpx.get(f"{mock_servers['proxy_url']}/test/finished", timeout=2.0).json()["finished"]
+        assert before == after
+
+    @pytest.mark.asyncio
+    async def test_swallows_server_errors(self, error_router, mock_servers):
+        """A non-2xx router response does not raise (cleanup must not fail)."""
+        client = RemoteInferenceClient(
+            proxy_url=error_router,
+            server_urls=mock_servers["server_urls"],
+            data_parallel_size=1,
+        )
+        try:
+            await client.finish_session("traj-error")
+        finally:
+            await client.teardown()
+
+    @pytest.mark.asyncio
+    async def test_swallows_connection_errors(self, mock_servers):
+        """An unreachable router does not raise."""
+        client = RemoteInferenceClient(
+            proxy_url=f"http://127.0.0.1:{get_open_port()}",
+            server_urls=mock_servers["server_urls"],
+            data_parallel_size=1,
+        )
+        try:
+            await client.finish_session("traj-unreachable")
         finally:
             await client.teardown()

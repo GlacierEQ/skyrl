@@ -23,7 +23,7 @@ set -x
 : "${INFERENCE_BACKEND:=vllm}"
 : "${MAX_TURNS:=1}"
 
-uv run --isolated --extra fsdp --with "openenv-core@git+https://github.com/meta-pytorch/OpenEnv.git" --with "litellm>=1.75.5" -m examples.train_integrations.openenv.entrypoints.main_openenv \
+uv run --isolated --extra fsdp --with "openenv-core@git+https://github.com/openenv/OpenEnv.git" --with "litellm>=1.75.5" -m examples.train_integrations.openenv.entrypoints.main_openenv \
   data.train_data="['$DATA_DIR/train.parquet']" \
   data.val_data="['$DATA_DIR/validation.parquet']" \
   trainer.algorithm.advantage_estimator="grpo" \
@@ -58,7 +58,6 @@ uv run --isolated --extra fsdp --with "openenv-core@git+https://github.com/meta-
   generator.inference_engine.backend=$INFERENCE_BACKEND \
   generator.inference_engine.run_engines_locally=true \
   generator.inference_engine.weight_sync_backend=nccl \
-  generator.inference_engine.async_engine=true \
   generator.batched=false \
   environment.env_class=openenv \
   generator.use_conversation_multi_turn=false \

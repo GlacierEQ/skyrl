@@ -16,14 +16,14 @@ uv run --isolated --extra fsdp \
     python -m skyrl.train.main_sft \
     strategy=fsdp \
     model.path=Qwen/Qwen2.5-0.5B-Instruct \
-    dataset_name=yahma/alpaca-cleaned \
-    dataset_split="train[:100]" \
+    train_datasets="['yahma/alpaca-cleaned']" \
+    train_dataset_splits="['train[:100]']" \
     messages_key=messages \
     max_length=512 \
     num_steps=10 \
     batch_size=4 \
     micro_train_batch_size_per_gpu=2 \
-    use_sample_packing=true \
+    remove_microbatch_padding=true \
     seed=42 \
     optimizer_config.lr=1e-6 \
     optimizer_config.weight_decay=1e-2 \

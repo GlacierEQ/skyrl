@@ -6,15 +6,21 @@ installed.
 
 import sys
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
+
+pytestmark = pytest.mark.megatron
 
 
-def _fft_dispatch_cfg() -> SimpleNamespace:
+def _fft_dispatch_cfg(weight_sync_backend: str = "nccl") -> SimpleNamespace:
     """Build the minimal ``self.cfg`` view that ``save_weights_for_sampler``
     inspects on the non-colocated path. Defaults to FFT (lora.rank=0) so
     the pause/resume branch is taken.
+
+    ``weight_sync_backend`` defaults to ``"nccl"`` so the caller-pauses branch is
+    exercised; pass ``"delta"`` for the branch where the sender pauses internally.
     """
     return SimpleNamespace(
         trainer=SimpleNamespace(
@@ -23,11 +29,96 @@ def _fft_dispatch_cfg() -> SimpleNamespace:
                 model=SimpleNamespace(lora=SimpleNamespace(rank=0)),
                 megatron_config=SimpleNamespace(lora_config=SimpleNamespace(merge_lora=False)),
             ),
-        )
+        ),
+        generator=SimpleNamespace(
+            inference_engine=SimpleNamespace(offload_kv_for_weight_sync=False, weight_sync_backend=weight_sync_backend)
+        ),
     )
 
 
 _has_megatron = "megatron" in sys.modules or __import__("importlib").util.find_spec("megatron") is not None
+
+
+# ---------------------------------------------------------------------------
+# Packed aligned tensors
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not _has_megatron, reason="megatron-core not installed")
+@pytest.mark.parametrize(
+    ("values", "attention_mask", "cu_seqlens", "sub_seq_lengths", "expected"),
+    [
+        (
+            [[10, 11, 12, 0], [20, 21, 0, 0]],
+            [[1, 1, 1, 0], [1, 1, 0, 0]],
+            [0, 4, 8],
+            None,
+            [[10, 11, 12, 0, 20, 21, 0, 0]],
+        ),
+        (
+            [[10, 11, 0, 0, 20, 21, 22, 0]],
+            [[1, 1, 0, 0, 1, 1, 1, 0]],
+            [0, 4, 8],
+            [[2, 3]],
+            [[10, 11, 0, 0, 20, 21, 22, 0]],
+        ),
+    ],
+)
+def test_pack_sequence_values_uses_target_layout(values, attention_mask, cu_seqlens, sub_seq_lengths, expected):
+    from skyrl.backends.skyrl_train.workers.megatron.megatron_model_wrapper import (
+        _pack_sequence_values,
+    )
+
+    packed_seq_params = SimpleNamespace(cu_seqlens_q_padded=torch.tensor(cu_seqlens))
+    actual = _pack_sequence_values(
+        torch.tensor(values),
+        torch.tensor(attention_mask, dtype=torch.bool),
+        packed_seq_params,
+        sub_seq_lengths,
+    )
+    torch.testing.assert_close(actual, torch.tensor(expected))
+
+
+@pytest.mark.skipif(not _has_megatron, reason="megatron-core not installed")
+def test_packed_fused_active_mask_is_cp_local_and_two_dimensional():
+    from skyrl.backends.skyrl_train.distributed.megatron import model_utils
+
+    hidden = torch.zeros((1, 4, 128))
+    weight = torch.zeros((16, 128))
+    target = torch.arange(8).unsqueeze(0)
+    active_mask = torch.tensor([[True, False, True, False, True, False, True, False]])
+    cu_seqlens = torch.tensor([0, 8])
+    tp_group = object()
+    cp_group = object()
+
+    def fused_apply(*args, **kwargs):
+        # No final logit softcap here; a softcapped model (Beam) passes it by keyword.
+        assert kwargs.get("softcap") is None
+        local_mask = args[-3]
+        assert local_mask.shape == (1, 4)
+        torch.testing.assert_close(local_mask, torch.tensor([[True, False, True, False]]))
+        return torch.zeros((1, 4))
+
+    with (
+        patch.object(model_utils.torch.distributed, "get_world_size", return_value=2),
+        patch.object(model_utils.torch.distributed, "get_rank", return_value=0),
+        patch.object(model_utils, "_fused_lm_head_logprob_apply", side_effect=fused_apply),
+        patch.object(model_utils, "allgather_cp_sharded_packed_tensor", return_value=torch.zeros(8)),
+    ):
+        result = model_utils.from_parallel_hidden_to_logprobs_packed_sequences(
+            hidden,
+            weight,
+            target,
+            cu_seqlens,
+            unpacked_seqlen=8,
+            vocab_start_index=0,
+            vocab_end_index=16,
+            group=tp_group,
+            cp_group=cp_group,
+            active_mask=active_mask,
+        )
+
+    assert result.shape == (1, 7)
 
 
 # ---------------------------------------------------------------------------
@@ -49,6 +140,9 @@ class TestGradScaleFunc:
         mock_config_obj = MagicMock()
         mock_config_obj.finalize_model_grads_func = None
         mock_config_obj.grad_scale_func = None
+        mock_config_obj.calculate_per_token_loss = False
+        mock_config_obj.mlp_chunks_for_training = 1
+        mock_config_obj.sequence_parallel = True
 
         mock_optimizer = MagicMock()
         mock_optimizer.scale_loss = MagicMock(return_value=1.0)
@@ -58,7 +152,7 @@ class TestGradScaleFunc:
             return_value=mock_config_obj,
         ):
             mock_skyrl_config = MagicMock()
-            mock_skyrl_config.trainer.use_sample_packing = False
+            mock_skyrl_config.trainer.remove_microbatch_padding = False
 
             MegatronModelWrapper(
                 config=mock_skyrl_config,
@@ -78,13 +172,16 @@ class TestGradScaleFunc:
         mock_config_obj = MagicMock()
         mock_config_obj.finalize_model_grads_func = None
         mock_config_obj.grad_scale_func = None
+        mock_config_obj.calculate_per_token_loss = False
+        mock_config_obj.mlp_chunks_for_training = 1
+        mock_config_obj.sequence_parallel = False
 
         with patch(
             "skyrl.backends.skyrl_train.workers.megatron.megatron_model_wrapper.get_model_config",
             return_value=mock_config_obj,
         ):
             mock_skyrl_config = MagicMock()
-            mock_skyrl_config.trainer.use_sample_packing = False
+            mock_skyrl_config.trainer.remove_microbatch_padding = False
 
             MegatronModelWrapper(
                 config=mock_skyrl_config,
@@ -93,6 +190,36 @@ class TestGradScaleFunc:
             )
 
         assert mock_config_obj.grad_scale_func is None
+
+
+@pytest.mark.skipif(not _has_megatron, reason="megatron-core not installed")
+@pytest.mark.parametrize("overlap_grad_reduce", [False, True])
+def test_per_token_loss_requires_no_overlap_grad_reduce(overlap_grad_reduce):
+    """Under calculate_per_token_loss the wrapper rescales grad buffers between calls, which would
+    race with overlapped grad reductions, so overlap_grad_reduce=True is refused at init."""
+    from skyrl.backends.skyrl_train.workers.megatron.megatron_model_wrapper import (
+        MegatronModelWrapper,
+    )
+
+    mock_module = MagicMock()
+    mock_module.ddp_config.overlap_grad_reduce = overlap_grad_reduce
+    mock_config_obj = MagicMock()
+    mock_config_obj.calculate_per_token_loss = True
+    mock_config_obj.mlp_chunks_for_training = 1
+    mock_config_obj.sequence_parallel = False
+    mock_skyrl_config = MagicMock()
+    mock_skyrl_config.trainer.remove_microbatch_padding = True
+
+    with patch(
+        "skyrl.backends.skyrl_train.workers.megatron.megatron_model_wrapper.get_model_config",
+        return_value=mock_config_obj,
+    ):
+        if overlap_grad_reduce:
+            with pytest.raises(ValueError, match="overlap_grad_reduce=false"):
+                MegatronModelWrapper(config=mock_skyrl_config, actor_module=[mock_module], actor_optimizer=None)
+        else:
+            wrapper = MegatronModelWrapper(config=mock_skyrl_config, actor_module=[mock_module], actor_optimizer=None)
+            assert wrapper._per_token_loss
 
 
 # ---------------------------------------------------------------------------
@@ -126,150 +253,3 @@ class TestSeedVariation:
             with patch("random.seed", side_effect=lambda s: captured.append(s)):
                 strategy.set_seed(42)
             assert captured[0] == expected_seed
-
-
-# ---------------------------------------------------------------------------
-# C5: Pause/flush for non-colocated weight sync
-# ---------------------------------------------------------------------------
-
-
-class TestWeightSyncPauseFlush:
-    """Verify save_weights_for_sampler pauses/resumes in non-colocated mode."""
-
-    @pytest.mark.asyncio
-    async def test_non_colocated_calls_pause_and_resume(self):
-        from skyrl.backends.skyrl_train.workers.worker_dispatch import WorkerDispatch
-
-        dispatch = WorkerDispatch.__new__(WorkerDispatch)
-        dispatch.colocate_all = False
-        dispatch.cfg = _fft_dispatch_cfg()
-        dispatch._inference_engine_client = AsyncMock()
-        dispatch._broadcast_to_inference_engines = MagicMock()
-        dispatch._prepare_for_weight_sync = MagicMock()
-        dispatch._finish_weight_sync = MagicMock()
-        dispatch.ensure_active_adapter = MagicMock()
-
-        await dispatch.save_weights_for_sampler()
-
-        dispatch._inference_engine_client.pause_generation.assert_awaited_once()
-        dispatch._broadcast_to_inference_engines.assert_called_once()
-        dispatch._inference_engine_client.resume_generation.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_colocated_uses_wake_up(self):
-        from skyrl.backends.skyrl_train.workers.worker_dispatch import WorkerDispatch
-
-        dispatch = WorkerDispatch.__new__(WorkerDispatch)
-        dispatch.colocate_all = True
-        dispatch.cfg = _fft_dispatch_cfg()
-        dispatch._inference_engine_client = AsyncMock()
-        dispatch._broadcast_to_inference_engines = MagicMock()
-        dispatch._prepare_for_weight_sync = MagicMock()
-        dispatch._finish_weight_sync = MagicMock()
-        dispatch.ensure_active_adapter = MagicMock()
-
-        await dispatch.save_weights_for_sampler()
-
-        dispatch._inference_engine_client.wake_up.assert_awaited()
-        dispatch._inference_engine_client.pause_generation.assert_not_awaited()
-        dispatch._inference_engine_client.resume_generation.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_non_colocated_pause_before_broadcast(self):
-        from skyrl.backends.skyrl_train.workers.worker_dispatch import WorkerDispatch
-
-        call_order = []
-
-        dispatch = WorkerDispatch.__new__(WorkerDispatch)
-        dispatch.colocate_all = False
-        dispatch.cfg = _fft_dispatch_cfg()
-        dispatch._inference_engine_client = AsyncMock()
-        dispatch._inference_engine_client.pause_generation = AsyncMock(side_effect=lambda: call_order.append("pause"))
-        dispatch._inference_engine_client.resume_generation = AsyncMock(side_effect=lambda: call_order.append("resume"))
-        dispatch._broadcast_to_inference_engines = MagicMock(
-            side_effect=lambda *args, **kwargs: call_order.append("broadcast")
-        )
-        dispatch._prepare_for_weight_sync = MagicMock()
-        dispatch._finish_weight_sync = MagicMock()
-        dispatch.ensure_active_adapter = MagicMock()
-
-        await dispatch.save_weights_for_sampler()
-
-        assert call_order == ["pause", "broadcast", "resume"]
-
-    @pytest.mark.asyncio
-    async def test_non_colocated_resumes_on_broadcast_failure(self):
-        """resume_generation must be called even if broadcast raises."""
-        from skyrl.backends.skyrl_train.workers.worker_dispatch import WorkerDispatch
-
-        dispatch = WorkerDispatch.__new__(WorkerDispatch)
-        dispatch.colocate_all = False
-        dispatch.cfg = _fft_dispatch_cfg()
-        dispatch._inference_engine_client = AsyncMock()
-        dispatch._broadcast_to_inference_engines = MagicMock(side_effect=RuntimeError("broadcast failed"))
-        dispatch._prepare_for_weight_sync = MagicMock()
-        dispatch._finish_weight_sync = MagicMock()
-        dispatch.ensure_active_adapter = MagicMock()
-
-        with pytest.raises(RuntimeError, match="broadcast failed"):
-            await dispatch.save_weights_for_sampler()
-
-        dispatch._inference_engine_client.pause_generation.assert_awaited_once()
-        dispatch._inference_engine_client.resume_generation.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_non_colocated_inplace_lora_skips_pause_and_resume(self):
-        """In-place LoRA (lora.rank>0, no merge_lora) must NOT pause/resume.
-
-        Mirrors the multi-tenant branch in
-        ``save_weights_for_sampler``: when the engine's LoRA tensors are
-        swapped in place via ``load_lora_adapter``, the weight sync is
-        dispatched without any pause — load_lora_adapter is the engine-
-        side primitive that's expected to be safe under in-flight
-        requests on its own.
-        """
-        from skyrl.backends.skyrl_train.workers.worker_dispatch import WorkerDispatch
-
-        cfg = _fft_dispatch_cfg()
-        cfg.trainer.policy.model.lora.rank = 32  # in-place LoRA path
-        cfg.trainer.policy.megatron_config.lora_config.merge_lora = False
-
-        dispatch = WorkerDispatch.__new__(WorkerDispatch)
-        dispatch.colocate_all = False
-        dispatch.cfg = cfg
-        dispatch._inference_engine_client = AsyncMock()
-        dispatch._broadcast_to_inference_engines = MagicMock()
-        dispatch._prepare_for_weight_sync = MagicMock()
-        dispatch._finish_weight_sync = MagicMock()
-        dispatch.ensure_active_adapter = MagicMock()
-
-        await dispatch.save_weights_for_sampler(model_id="lora-target")
-
-        dispatch._broadcast_to_inference_engines.assert_called_once()
-        dispatch._inference_engine_client.pause_generation.assert_not_awaited()
-        dispatch._inference_engine_client.resume_generation.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_non_colocated_megatron_merge_lora_still_pauses(self):
-        """Megatron + merge_lora keeps the pause/resume path (LoRA merged
-        into the base weights → tensors flow over NCCL, not load_lora_adapter)."""
-        from skyrl.backends.skyrl_train.workers.worker_dispatch import WorkerDispatch
-
-        cfg = _fft_dispatch_cfg()
-        cfg.trainer.strategy = "megatron"
-        cfg.trainer.policy.model.lora.rank = 32
-        cfg.trainer.policy.megatron_config.lora_config.merge_lora = True
-
-        dispatch = WorkerDispatch.__new__(WorkerDispatch)
-        dispatch.colocate_all = False
-        dispatch.cfg = cfg
-        dispatch._inference_engine_client = AsyncMock()
-        dispatch._broadcast_to_inference_engines = MagicMock()
-        dispatch._prepare_for_weight_sync = MagicMock()
-        dispatch._finish_weight_sync = MagicMock()
-        dispatch.ensure_active_adapter = MagicMock()
-
-        await dispatch.save_weights_for_sampler()
-
-        dispatch._inference_engine_client.pause_generation.assert_awaited_once()
-        dispatch._inference_engine_client.resume_generation.assert_awaited_once()

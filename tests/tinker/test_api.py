@@ -1,11 +1,10 @@
 """Tests for the Tinker API mock server using the real tinker client."""
 
 import asyncio
+import dataclasses
 import os
-import subprocess
 import tempfile
 import urllib.request
-from contextlib import contextmanager
 from urllib.parse import urlparse
 
 import pytest
@@ -15,7 +14,7 @@ from transformers import AutoTokenizer
 
 from skyrl.tinker.api import _build_uv_run_cmd_engine
 from skyrl.tinker.config import EngineConfig
-from tests.tinker.conftest import wait_for_condition
+from tests.tinker.conftest import start_api_server, wait_for_condition
 
 BASE_MODEL = "trl-internal-testing/tiny-Qwen3ForCausalLM"
 
@@ -47,43 +46,21 @@ def create_service_and_training_client(base_url: str, skip_verify: bool = False)
     return service_client, training_client
 
 
-@contextmanager
-def start_api_server(overrides: dict[str, str] | None = None):
-    """Start the FastAPI server with optional config overrides. Prints log on failure."""
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        log_path = os.path.join(tmp_dir, "server.log")
-        db_path = os.path.join(tmp_dir, "server.db")
-
-        with open(log_path, "w") as log_file:
-            defaults = {
-                "host": "0.0.0.0",
-                "port": str(TEST_SERVER_PORT),
-                "base-model": BASE_MODEL,
-                "backend-config": '{"max_lora_adapters": 4}',
-                "database-url": f"sqlite:///{db_path}",
-            }
-            if overrides:
-                defaults.update(overrides)
-            cmd = ["uv", "run", "--extra", "tinker", "-m", "skyrl.tinker.api"]
-            for key, value in defaults.items():
-                cmd.extend([f"--{key}", value])
-            process = subprocess.Popen(cmd, stdout=log_file, stderr=log_file)
-            print(f"Starting API server: {' '.join(cmd)}")
-            try:
-                yield process, log_path
-            except Exception:
-                with open(log_path) as f:
-                    print(f"=== Test failed. Server log ({log_path}) ===\n{f.read()}")
-                raise
-            finally:
-                process.terminate()
-                process.wait(timeout=5)
-
-
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="function")
 def api_server():
-    """Start the FastAPI server for testing."""
-    with start_api_server() as server:
+    """Start a fresh FastAPI server for each test.
+
+    Function-scoped rather than module-scoped: the backend only reclaims a
+    model's LoRA-adapter slot on explicit unload or stale-session cleanup
+    (session_timeout), and tinker>=0.17 keeps a per-client background heartbeat
+    thread alive so earlier tests' sessions never go stale within a run. A shared
+    server therefore accumulates adapters across the module and exhausts the
+    (memory-bounded) pool. A fresh server per test keeps each test within its own
+    handful of adapters. wait_for_up ensures the engine is ready before the test;
+    the longer teardown timeout lets the lifespan shutdown reap the engine
+    subprocess so it isn't orphaned across restarts.
+    """
+    with start_api_server(port=TEST_SERVER_PORT, wait_for_up=True, teardown_timeout=20.0) as server:
         yield server
 
 
@@ -126,6 +103,24 @@ def custom_cross_entropy_loss(data, model_logprobs):
         weights = weights.to_torch() if weights else 1.0
         total_loss += -(log_p * weights).sum()
     return total_loss, {}
+
+
+def assert_loss_fn_outputs_equal(actual, expected):
+    """Compare two ``loss_fn_outputs`` (list[dict[str, TensorData]]) by value.
+
+    tinker>=0.17 makes ``TensorData`` a ``@dataclass(eq=False)``, so ``==`` on
+    ``TensorData`` (and therefore on the lists/dicts containing them) falls back
+    to identity and is never true across separate responses. Compare the tensor
+    contents (dtype/shape/data) explicitly instead.
+    """
+    assert len(actual) == len(expected)
+    for a_datum, e_datum in zip(actual, expected):
+        assert a_datum.keys() == e_datum.keys()
+        for key in e_datum:
+            a, e = a_datum[key], e_datum[key]
+            assert a.dtype == e.dtype
+            assert a.shape == e.shape
+            assert a.data == e.data
 
 
 def test_training_workflow(service_client):
@@ -171,21 +166,28 @@ def test_training_workflow(service_client):
     # The third example omits weights (auto-filled with 1s), so all losses should be non-zero
     assert all(v != 0.0 for v in fwdbwd_result.loss_fn_outputs[2]["elementwise_loss"].data)
 
-    # Load the optimizer state and verify another forward_backward pass has the same loss
-    training_client.load_state(resume_path)
+    # Matching the Tinker service, LoadWeights is only permitted as a model's first
+    # request; this client has already saved and trained, so both load flavors are rejected.
+    with pytest.raises(Exception, match="LoadWeights is not permitted"):
+        training_client.load_state(resume_path).result()
+    with pytest.raises(Exception, match="LoadWeights is not permitted"):
+        training_client.load_state_with_optimizer(resume_path).result()
+
+    # Restore the run on a fresh client instead (weights-only load as its first request)
+    # and verify a forward_backward pass reproduces the pre-optim-step losses.
+    training_client = service_client.create_training_client_from_state(resume_path)
     fwdbwd_result2 = training_client.forward_backward(processed_examples, "cross_entropy").result()
-    assert fwdbwd_result2.loss_fn_outputs == fwdbwd_result.loss_fn_outputs
+    assert_loss_fn_outputs_equal(fwdbwd_result2.loss_fn_outputs, fwdbwd_result.loss_fn_outputs)
     # Also check that custom loss function produces the same loss
     fwdbwd_result_custom = training_client.forward_backward_custom(
         processed_examples, loss_fn=custom_cross_entropy_loss
     ).result()
-    assert fwdbwd_result_custom.loss_fn_outputs == fwdbwd_result.loss_fn_outputs
+    assert_loss_fn_outputs_equal(fwdbwd_result_custom.loss_fn_outputs, fwdbwd_result.loss_fn_outputs)
 
-    # Test that we can restore the training run
-    training_client = service_client.create_training_client_from_state(resume_path)
-    # Verify the restored client has the same state by running forward_backward again
-    fwdbwd_result3 = training_client.forward_backward(processed_examples, "cross_entropy").result()
-    assert fwdbwd_result3.loss_fn_outputs == fwdbwd_result.loss_fn_outputs
+    # Restoring with optimizer state also loads as a fresh client's first request
+    training_client_opt = service_client.create_training_client_from_state_with_optimizer(resume_path)
+    fwdbwd_result3 = training_client_opt.forward_backward(processed_examples, "cross_entropy").result()
+    assert_loss_fn_outputs_equal(fwdbwd_result3.loss_fn_outputs, fwdbwd_result.loss_fn_outputs)
 
     sampling_path = training_client.save_weights_for_sampler(name="final").result().path
     parsed = urlparse(sampling_path)
@@ -216,6 +218,78 @@ def test_training_workflow(service_client):
     assert training_run.corrupted is False
 
 
+def test_delete_checkpoint(tmp_path):
+    """Test that deleting checkpoints removes them from the listing and from disk.
+
+    Mirrors the real-client style of ``test_training_workflow``: save several
+    training checkpoints plus a sampler checkpoint, then delete a subset via the
+    REST client and verify the deleted checkpoints disappear from both the
+    listing and the on-disk checkpoint store, while the rest are untouched. The
+    server is started with an explicit ``checkpoints-base`` so the test knows
+    where the artifacts live on disk.
+    """
+    checkpoints_base = tmp_path / "checkpoints"
+    with start_api_server(
+        port=TEST_SERVER_PORT,
+        overrides={"checkpoints-base": str(checkpoints_base)},
+        wait_for_up=True,
+        teardown_timeout=20.0,
+    ):
+        service_client = tinker.ServiceClient(base_url=f"http://0.0.0.0:{TEST_SERVER_PORT}/", api_key=TINKER_API_KEY)
+        training_client = service_client.create_lora_training_client(base_model=BASE_MODEL)
+        rest_client = service_client.create_rest_client()
+
+        # Save several training checkpoints and one sampler checkpoint.
+        training_run_id = None
+        for name in ["ckpt0", "ckpt1", "ckpt2", "ckpt3"]:
+            resume_path = training_client.save_state(name=name).result().path
+            training_run_id = urlparse(resume_path).netloc
+        training_client.save_weights_for_sampler(name="sampler0").result()
+
+        # On-disk layout: training -> <base>/<run>/<id>.tar.gz,
+        # sampler -> <base>/<run>/sampler_weights/<id>.tar.gz (see checkpoint_file_path).
+        def training_ckpt_file(checkpoint_id):
+            return checkpoints_base / training_run_id / f"{checkpoint_id}.tar.gz"
+
+        def sampler_ckpt_file(checkpoint_id):
+            return checkpoints_base / training_run_id / "sampler_weights" / f"{checkpoint_id}.tar.gz"
+
+        def listed_checkpoints():
+            return {
+                ckpt.checkpoint_id: ckpt for ckpt in rest_client.list_checkpoints(training_run_id).result().checkpoints
+            }
+
+        assert set(listed_checkpoints()) == {"ckpt0", "ckpt1", "ckpt2", "ckpt3", "sampler0"}
+        for checkpoint_id in ["ckpt0", "ckpt1", "ckpt2", "ckpt3"]:
+            assert training_ckpt_file(checkpoint_id).exists()
+        assert sampler_ckpt_file("sampler0").exists()
+
+        # Delete two training checkpoints and the sampler checkpoint. Delete via the
+        # type-qualified tinker path (the canonical tinker flow); the checkpoint type
+        # is carried by the path's "weights/"/"sampler_weights/" prefix.
+        checkpoints = listed_checkpoints()
+        for checkpoint_id in ["ckpt1", "ckpt3", "sampler0"]:
+            rest_client.delete_checkpoint_from_tinker_path(checkpoints[checkpoint_id].tinker_path).result()
+
+        # Deleted checkpoints are gone from both the listing and disk.
+        assert set(listed_checkpoints()) == {"ckpt0", "ckpt2"}
+        assert not training_ckpt_file("ckpt1").exists()
+        assert not training_ckpt_file("ckpt3").exists()
+        assert not sampler_ckpt_file("sampler0").exists()
+        # Un-deleted checkpoints remain on disk.
+        assert training_ckpt_file("ckpt0").exists()
+        assert training_ckpt_file("ckpt2").exists()
+
+        # A bare (untyped) id is rejected with 400 -- the checkpoint type must be
+        # explicit, since a training and sampler checkpoint could share an id. This
+        # matches upstream tinker. The rejected delete must leave the checkpoint intact.
+        with pytest.raises(Exception) as exc_info:
+            rest_client.delete_checkpoint(training_run_id, "ckpt0").result()
+        assert getattr(exc_info.value, "status_code", None) == 400
+        assert set(listed_checkpoints()) == {"ckpt0", "ckpt2"}
+        assert training_ckpt_file("ckpt0").exists()
+
+
 @pytest.mark.parametrize("use_lora", [False, True], ids=["base_model", "lora_model"])
 def test_sample(service_client, use_lora):
     """Test the sample endpoint with base model or LoRA adapter."""
@@ -226,6 +300,10 @@ def test_sample(service_client, use_lora):
         sampling_client = training_client.save_weights_and_get_sampling_client(name="test_sample")
     else:
         sampling_client = service_client.create_sampling_client(base_model=BASE_MODEL)
+
+    # The sampling client should be able to fetch its tokenizer via /api/v1/samplers/{id}.
+    sampler_tokenizer = sampling_client.get_tokenizer()
+    assert sampler_tokenizer.encode("hello") == tokenizer.encode("hello")
 
     # Sample from the model (base or LoRA)
     prompt = types.ModelInput.from_ints(tokenizer.encode("Hello, how are you doing today? ", add_special_tokens=True))
@@ -241,11 +319,19 @@ def test_sample(service_client, use_lora):
         requests.append(request)
 
     # Verify we got the right number of sequences and tokens back
+    sequence_ids = []
     for request, num_samples, max_tokens in zip(requests, num_samples_per_request, max_tokens_per_request):
         sample_result = request.result()
         assert sample_result is not None
         assert len(sample_result.sequences) == num_samples
         assert len(sample_result.sequences[0].tokens) == max_tokens
+        sequence_ids.extend(getattr(seq, "sequence_id", None) for seq in sample_result.sequences)
+    # tinker>=0.26 stamps the ids the asample promise returned onto each
+    # sequence; one distinct id per sample across the session. Older SDKs
+    # have no ``sequence_id`` field and ignore the promise's ids.
+    if "sequence_id" in {f.name for f in dataclasses.fields(types.SampledSequence)}:
+        assert all(sequence_ids)
+        assert len(set(sequence_ids)) == len(sequence_ids)
 
     # Test stop tokens: generate once, then use the 5th token as a stop token
     initial_result = sampling_client.sample(
@@ -292,6 +378,46 @@ def test_sample_top_k(service_client):
     # top_k=-1 (disabled) should vary with different seeds
     results_no_top_k = sample_with_top_k(top_k=-1)
     assert not all(seq == results_no_top_k[0] for seq in results_no_top_k), "Without top_k, outputs should vary"
+
+
+def test_sample_prompt_logprobs(service_client):
+    """Test that prompt logprob requests reach the backend and come back populated."""
+    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
+    sampling_client = service_client.create_sampling_client(base_model=BASE_MODEL)
+    prompt_tokens = tokenizer.encode("Hello, how are you doing today? ", add_special_tokens=True)
+    prompt = types.ModelInput.from_ints(prompt_tokens)
+    sampling_params = types.SamplingParams(temperature=0.0, max_tokens=4, seed=42)
+
+    result = sampling_client.sample(
+        prompt=prompt,
+        sampling_params=sampling_params,
+        num_samples=1,
+        include_prompt_logprobs=True,
+    ).result()
+    assert result.prompt_logprobs is not None
+    assert all(lp is None or isinstance(lp, float) for lp in result.prompt_logprobs)
+    # Not requested, so the field stays unset rather than being invented.
+    assert result.topk_prompt_logprobs is None
+
+    # Without the flag the backend must not pay for prompt logprobs at all.
+    assert (
+        sampling_client.sample(prompt=prompt, sampling_params=sampling_params, num_samples=1).result().prompt_logprobs
+        is None
+    )
+
+    # topk needs a full per-position distribution, which the JAX generator does
+    # not produce; the request must fail loudly instead of silently dropping it.
+    # The SkyRL-Train backend (megatron/fsdp) does support it -- the full
+    # contract runs end-to-end on megatron + vLLM in
+    # tests/tinker/skyrl_train/test_multi_lora_megatron.py::test_sample_prompt_logprobs.
+    with pytest.raises(ValueError, match="topk_prompt_logprobs is not supported"):
+        sampling_client.sample(
+            prompt=prompt,
+            sampling_params=sampling_params,
+            num_samples=1,
+            include_prompt_logprobs=True,
+            topk_prompt_logprobs=4,
+        ).result()
 
 
 def test_sample_with_stop_strings(service_client):
@@ -369,8 +495,8 @@ def test_sample_num_samples_diversity(service_client):
 def api_server_fast_cleanup():
     """Start the FastAPI server with fast cleanup settings for testing."""
     with start_api_server(
+        port=TEST_SERVER_PORT_FAST_CLEANUP,
         overrides={
-            "port": str(TEST_SERVER_PORT_FAST_CLEANUP),
             "session-cleanup-interval-sec": str(FAST_CLEANUP_INTERVAL_SEC),
             "session-timeout-sec": str(FAST_CLEANUP_TIMEOUT_SEC),
         },
@@ -387,16 +513,34 @@ def test_unload_model(api_server):
         async with tinker._client.AsyncTinker(
             api_key=TINKER_API_KEY, base_url=f"http://0.0.0.0:{TEST_SERVER_PORT}/"
         ) as client:
-            future = await client.models.unload(request=types.UnloadModelRequest(model_id=training_client.model_id))
+            # tinker>=0.26 dropped ``client.models.unload`` (the request/response
+            # types remain), so post to the endpoint through the generic client.
+            future = await client.post(
+                "/api/v1/unload_model",
+                body=types.UnloadModelRequest(model_id=training_client.model_id).model_dump(mode="json"),
+                cast_to=types.UntypedAPIFuture,
+            )
             while True:
-                result = await client.futures.retrieve(
+                # NOTE: ``futures.retrieve`` casts to the ``FutureRetrieveResponse``
+                # union, which has no discriminator. tinker>=0.17 resolves such a
+                # union to its first member (``TryAgainResponse``) regardless of the
+                # payload, so ``isinstance(result, UnloadModelResponse)`` is never
+                # true and this loop spins forever. Read the raw body instead and
+                # dispatch on the server's ``type`` field. (The high-level
+                # ``APIFuture.result()`` path is unaffected; it deserializes into a
+                # concrete type rather than the union.)
+                response = await client.futures.with_raw_response.retrieve(
                     request=types.FutureRetrieveRequest(request_id=future.request_id)
                 )
-                if isinstance(result, types.UnloadModelResponse):
-                    return result
-                await asyncio.sleep(0.1)
+                body = await response.json()
+                if body.get("type") == "try_again":
+                    await asyncio.sleep(0.1)
+                    continue
+                return body
 
-    assert isinstance(asyncio.run(unload_model()), types.UnloadModelResponse)
+    result = asyncio.run(unload_model())
+    assert result["type"] == "unload_model"
+    assert result["model_id"] == training_client.model_id
 
     # Verify model no longer works after unload
     with pytest.raises(Exception):

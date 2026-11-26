@@ -57,12 +57,15 @@ A `GeneratorInput` provides a batch of prompts with trajectory IDs. A `Generator
 
 ## Code Structure
 
-The integration lives in `examples/train_integrations/harbor/`:
+The generator lives in `skyrl/integration/harbor/`, and the entrypoints and configs in `examples/train_integrations/harbor/`:
 
 ```
-examples/train_integrations/harbor/
+skyrl/integration/harbor/
   harbor_generator.py          # HarborGenerator: core bridge between SkyRL and Harbor
   dataset.py                   # HarborTaskDataset: loads task directory paths
+  trial_metrics.py             # Per-step trial phase and retry metrics
+
+examples/train_integrations/harbor/
   harbor_trial_config/
     default.yaml               # Harbor TrialConfig template
   entrypoints/
@@ -111,7 +114,7 @@ No other changes to SkyRL are needed.
 
 When `HarborGenerator` is created, it:
 
-1. Builds a `base_url` from the vLLM HTTP endpoint host and port.
+1. Uses SkyRL's router deployment as the `base_url` for generation requests.
 2. Converts the Harbor YAML config into a Python dict (the **config template**).
 3. Injects the model name (`hosted_vllm/{served_model_name}`) and API base URL (`{base_url}/v1`) into the template. These stay constant across all trials.
 4. Creates a rate limiter from the `generator.rate_limit` config (passed via `generator.rate_limit.*` overrides, separate from the Harbor TrialConfig).
@@ -160,6 +163,27 @@ task-dir/
 
 SkyRL never manages the sandbox or agent directly. The vLLM inference engine is exposed as an HTTP endpoint, and the Harbor agent calls it through LiteLLM as if it were any OpenAI-compatible API.
 
+### Session-aware Routing
+
+`HarborGenerator` injects a unique `session_id` (via `uuid4().hex`) into each trial's config, so all of a trajectory's LLM calls share one ID. SkyRL's data-plane router (`VLLMRouter`) uses vLLM's `consistent_hash` policy, which keys on the `X-Session-ID` HTTP header to pin a session to a single backend replica and keep its prefix cache warm across turns - see [Session-aware Routing](/docs/getting-started/inference_architecture#session-aware-routing).
+
+For this to take effect, the agent's LLM client must forward the session ID as the `X-Session-ID` header. Harbor's `LiteLLM` wrapper does exactly this - alongside `extra_body["session_id"]`, it also sets the header so the vLLM router can route on it:
+
+```python
+# src/harbor/llms/lite_llm.py
+if self._session_id is not None:
+    extra_body["session_id"] = self._session_id
+    # Also send the session id as the X-Session-ID HTTP header. Routers like the
+    # vLLM router (consistent_hash policy) key session affinity on this header.
+    completion_kwargs.setdefault("extra_headers", {})["X-Session-ID"] = self._session_id
+```
+
+If you build your own agent (instead of using Harbor's `terminus-2` / `LiteLLM` path), implement something similar: set the `X-Session-ID` header to a stable per-rollout ID on every request. Without it, the router still consistent-hashes requests but there's no trajectory-level pinning — turns of the same rollout aren't guaranteed to share a backend, so you lose the cross-turn prefix-cache reuse (correctness is unaffected, but multi-turn throughput drops).
+
+### Prefix-cache Salting
+
+When `generator.use_cache_salt=true` (the default), `HarborGenerator` computes a per-policy-version salt once per `generate` call — keyed on the inference engine's weight version and served model name — and injects it into each trial's config as `agent.kwargs.llm_kwargs.extra_body.cache_salt`. Harbor's `LiteLLM` wrapper forwards `extra_body` to `litellm.acompletion()`, which passes `cache_salt` as a top-level field of the vLLM chat-completions request. vLLM mixes the salt into its prefix-cache block hashes so blocks are only shared between trajectories started at the same policy version — cache is reused within a version (throughput) and isolated across weight updates (correctness). This matters for fully-async training, where the prefix cache is deliberately not fully cleared on every weight sync. See [`generator.use_cache_salt`](/docs/api-ref/skyrl/config) for details.
+
 ## Error Handling, Masking, and Retries
 
 ### Per-Trajectory Retries
@@ -170,7 +194,7 @@ Each trajectory gets up to 2 attempts (`MAX_NUM_RETRIES_PER_TRIAL = 2`). The ret
 |---|---|---|---|
 | **Success** | N/A | From verifier | Yes |
 | **`ContextLengthExceededError`** | No | 0 | Configurable (see below) |
-| **`AgentTimeoutError`** | No | - | No (loss-masked) |
+| **`AgentTimeoutError`** | No | 0 | No (loss-masked, see below) |
 | **Missing verifier result** | Yes | - | - |
 | **Other exceptions** | Yes | - | - |
 
@@ -181,7 +205,13 @@ When a trajectory hits `ContextLengthExceededError`, its reward is set to 0. Wha
 
 ### Instance-Level Masking
 
-After all trajectories in a batch complete, `_mask_failed_instances_and_compute_metrics()` scans the results. If **any** trajectory for a given prompt fails (timeout or error), **all** trajectories for that prompt are zeroed out (`loss_mask=[0]`) as a conservative approach.
+After all trajectories in a batch complete, the generator decides per prompt which trajectories to zero out (`loss_mask=[0]`, reward 0):
+
+- If **any** trajectory for a prompt failed after its retries (a sandbox that never started, no verifier result, an exception), **all** trajectories for that prompt are zeroed out.
+- If at least `generator.timeout_mask_instance_fraction` (default `0.25`) of a prompt's trajectories hit `AgentTimeoutError`, all of them are zeroed out too: that many timeouts in one group usually point at the task or the infrastructure. With 8 trajectories per prompt that is two timeouts; with 16 it is four.
+- Below that, only the timed-out trajectories are zeroed out, and the prompt's other trajectories train. `0` zeroes out the whole prompt on any timeout; `1` zeroes out only the timed-out trajectories.
+
+Advantage estimators that compare a prompt's trajectories with each other (`grpo`, `rloo`, `maxrl`) still count a zeroed-out trajectory as reward 0. `trainer.algorithm.zero_variance_filter` ignores zeroed-out trajectories, so it drops a group whose other trajectories all have the same reward.
 
 ### Rate Limiting
 
@@ -189,6 +219,10 @@ The generator includes built-in rate limiting to avoid overloading sandbox provi
 
 - **`trajectories_per_second`**: Throttles trial submission rate (e.g., 5/sec).
 - **`max_concurrency`**: Caps parallel `trial.run()` calls (e.g., 512).
+
+Rate-token waiters are served in FIFO order. Grouped samples retain their order
+when they reach the limiter together; trials can still complete in any order.
+Cancelling a waiter allows the remaining callers to proceed.
 
 These are configured via overrides on the `generator` config (not in the Harbor TrialConfig YAML). For example:
 
@@ -234,6 +268,7 @@ agent:
 | `generator.n_samples_per_prompt` | SkyRL config | Number of trajectories per prompt for GRPO advantage estimation (e.g., 8) |
 | `trainer.algorithm.max_seq_len` | SkyRL config | Maximum total sequence length (context window length). Required for Harbor — set to match vLLM's `max_model_len` |
 | `generator.apply_overlong_filtering` | SkyRL config | When `true`, zero out loss mask for context-length-exceeded trajectories (default: `false`) |
+| `generator.timeout_mask_instance_fraction` | SkyRL config | Share of a prompt's trajectories that must hit `AgentTimeoutError` before all of them are zeroed out; below it, the timed-out ones zero out only themselves (default: `0.25`) |
 | `trainer.algorithm.advantage_estimator` | SkyRL config | Advantage method: `grpo`, `rloo`, `reinforce_pp`, etc. |
 | `trainer.train_batch_size` | SkyRL config | Number of unique prompts per training batch |
 | `environment.type` | Harbor config | Sandbox provider: `daytona`, `docker`, `modal`, `e2b`, `gke` |
@@ -338,7 +373,7 @@ You must run `prepare_harbor_dataset.py` before launching training. The launch s
 - **Sandbox access**: Daytona API key (`DAYTONA_API_KEY`) or Modal credentials (`MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET`), or other sandbox providers that Harbor supports.
 - **Dataset**: Harbor task directories, each with `instruction.md` and `tests/test.sh`
 - **GPUs**: Typically 4-8 for combined training and inference
-- **vLLM HTTP endpoint**: Enabled via `generator.inference_engine.enable_http_endpoint=true`
+- **SkyRL inference server**: SkyRL launches the vLLM HTTP endpoint and router from `generator.inference_engine.*`.
 
 ### Launch
 
@@ -367,7 +402,6 @@ uv run --isolated --extra fsdp --extra harbor \
   generator.n_samples_per_prompt=8 \
   trainer.algorithm.advantage_estimator=grpo \
   trainer.train_batch_size=64 \
-  generator.inference_engine.enable_http_endpoint=true \
   generator.rate_limit.enabled=true \
   generator.rate_limit.trajectories_per_second=5 \
   generator.rate_limit.max_concurrency=512
@@ -385,5 +419,7 @@ The following metrics are logged to W&B:
 | `generate/num_timeout_trajectories` | Trajectories that hit agent timeout |
 | `generate/num_error_trajectories` | Trajectories that hit sandbox/agent errors |
 | `generate/num_masked_instances` | Instances excluded from training due to failures |
+| `generate/num_instance_with_timeouts_unmasked` | Instances with timed-out trajectories that still trained, below the fraction |
+| `generate/num_traj_masked_individually` | Timed-out trajectories zeroed out on their own |
 | `generate/trajectories_context_length_exceeded` | Trajectories that exceeded context window |
 | `generate/trajectories_summarized` | Trajectories where context summarization was triggered |

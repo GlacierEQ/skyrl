@@ -7,6 +7,7 @@ For details, see https://docs.skyrl.ai/docs/tutorials/skyrl_gym_generator
 
 import asyncio
 import copy
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -17,22 +18,32 @@ from loguru import logger
 from tqdm.asyncio import tqdm
 
 import skyrl_gym
-from skyrl.backends.skyrl_train.inference_engines.base import (
+from skyrl.backends.skyrl_train.inference_servers.base import (
     ConversationType,
     InferenceEngineInput,
+    InferenceEngineInterface,
 )
-from skyrl.backends.skyrl_train.inference_engines.inference_engine_client import (
-    InferenceEngineClient,
+from skyrl.backends.skyrl_train.utils.routed_experts import (
+    RoutedExpertIndices,
+    RoutedExpertTrace,
+)
+from skyrl.backends.skyrl_train.utils.sample_support import (
+    CompactSampleSupport,
+    SampleSupportTrace,
 )
 from skyrl.train.config import GeneratorConfig, SkyRLGymConfig
 from skyrl.train.generators.base import (
+    TRAINING_PHASE_EVAL,
+    TRAINING_PHASE_TRAIN,
     GeneratorInput,
     GeneratorInterface,
     GeneratorOutput,
+    TrainingPhase,
     TrajectoryID,
 )
 from skyrl.train.generators.utils import (
     apply_overlong_filtering,
+    build_vllm_cache_salt,
     get_custom_chat_template,
     get_generation_prompt_ids,
     get_rollout_metrics,
@@ -51,9 +62,16 @@ class TrajectoryOutput:
     prompt_ids: List[int]
     rollout_logprobs: Optional[List[float]]
     env_metrics: Dict[str, Any]
-    rollout_expert_indices: Optional[List[List[List[int]]]] = None
+    rollout_expert_indices: Optional[RoutedExpertIndices] = None
+    rollout_sample_support: Optional[CompactSampleSupport] = None
     pixel_values: Optional[torch.Tensor] = None
     image_grid_thw: Optional[torch.Tensor] = None
+    # End-to-end wall-clock time (seconds) to generate this trajectory. Optional: agent loops may
+    # leave this as None if they do not track timing.
+    e2e_time: Optional[float] = None
+    # Wall-clock seconds spent in each phase. "llm" is time in inference-engine calls, "env" is
+    # time in env.step. Field is None if any loop did not record a split.
+    time_splits: Optional[Dict[str, float]] = None
 
 
 @dataclass
@@ -61,6 +79,12 @@ class StepWiseOutput:
     """Output from a single agent_loop execution for step-wise training."""
 
     step_outputs: List[TrajectoryOutput]
+    # End-to-end wall-clock time (seconds) to generate this trajectory. Optional: agent loops may
+    # leave this as None if they do not track timing.
+    e2e_time: Optional[float] = None
+    # Wall-clock seconds spent in each phase. "llm" is time in inference-engine calls, "env" is
+    # time in env.step. Field is None if any loop did not record a split.
+    time_splits: Optional[Dict[str, float]] = None
 
 
 @dataclass
@@ -71,7 +95,10 @@ class AgentLoopState:
     rollout_logprobs: Optional[List[float]]
     response_end_idx: Optional[int]
     done: bool
-    rollout_expert_indices: Optional[List[List[List[int]]]] = None
+    routed_expert_trace: Optional[RoutedExpertTrace] = None
+    sample_support_trace: Optional[SampleSupportTrace] = None
+    # Support for an EOS sliced from a single-turn response.
+    dropped_eos_sample_support: Optional[CompactSampleSupport] = None
 
 
 @dataclass
@@ -81,30 +108,19 @@ class TurnOutput:
     output_logprobs: Optional[List[float]]
     new_obs: ConversationType
     obs_ids: List[int]
-    rollout_expert_indices: Optional[List[List[List[int]]]]  # [seq_len, layer_num, topk]
     reward: Optional[float]
+    rollout_sample_support: Optional[CompactSampleSupport] = None
     added_eos: bool = False
 
-    def get_turn_rollout_expert_indices(self) -> Optional[List[List[List[int]]]]:
-        """
-        Get rollout inference indices for this turn's tokens (output tokens + observation tokens).
-
-        Returns indices for generated output tokens, with padding entries (all 0)
-        for any manually-added EOS token and observation tokens
-        Returns None if rollout_expert_indices is None.
-        """
-        if self.rollout_expert_indices is None:
+    def get_turn_rollout_sample_support(self) -> Optional[CompactSampleSupport]:
+        """Return sample support padded over synthetic EOS and observation tokens."""
+        if self.rollout_sample_support is None:
             return None
-        if not self.rollout_expert_indices:
-            return self.rollout_expert_indices
-        layer_num = len(self.rollout_expert_indices[0])
-        topk = len(self.rollout_expert_indices[0][0]) if layer_num > 0 else 0
-        pad_entry = [[0] * topk for _ in range(layer_num)]
-        indices = list(self.rollout_expert_indices)
-        if self.added_eos:
-            indices.append(pad_entry)
-        indices.extend(pad_entry for _ in range(len(self.obs_ids)))
-        return indices
+        padding_count = int(self.added_eos) + len(self.obs_ids)
+        if not padding_count:
+            return self.rollout_sample_support
+        padding = self.rollout_sample_support.empty_like(padding_count)
+        return CompactSampleSupport.concat([self.rollout_sample_support, padding])
 
     def get_turn_loss_mask(self) -> List[int]:
         """
@@ -135,19 +151,26 @@ class TurnOutput:
         return self.output_logprobs + [0.0] * len(self.obs_ids)
 
 
+def _split_lists(time_splits: List[Optional[Dict[str, float]]]) -> Optional[Dict[str, List[float]]]:
+    """Per-component lists from per-trajectory time splits, or None if any trajectory lacks them."""
+    if not time_splits or any(s is None for s in time_splits):
+        return None
+    return {name: [s[name] for s in time_splits] for name in time_splits[0]}
+
+
 class SkyRLGymGenerator(GeneratorInterface):
     def __init__(
         self,
         generator_cfg: GeneratorConfig,
         skyrl_gym_cfg: SkyRLGymConfig,
-        inference_engine_client: InferenceEngineClient,
+        inference_engine_client: InferenceEngineInterface,
         tokenizer,
         policy_model_name: Optional[str] = None,
     ):
         """
         Args:
             generator_cfg: GeneratorConfig object containing the generator configuration
-            inference_engine_client: InferenceEngineClient object for interacting with the inference engines
+            inference_engine_client: InferenceEngineInterface object for interacting with the inference engines
             tokenizer: tokenizer object for encoding and decoding text
             policy_model_name: identifier the inference engine knows the policy
                 by (base model path or registered LoRA adapter name). Threaded
@@ -215,11 +238,43 @@ class SkyRLGymGenerator(GeneratorInterface):
                     f"`step_wise_trajectories` doesn't support custom chat template, got {generator_cfg.chat_template}"
                 )
 
-            if self.generator_cfg.inference_engine.enable_return_routed_experts:
-                raise ValueError("`step_wise_trajectories` doesn't support `enable_return_routed_experts=True`")
-
             if not self.use_conversation_multi_turn:
                 raise ValueError("`step_wise_trajectories` doesn't support `use_conversation_multi_turn=False`")
+
+            if generator_cfg.inference_engine.enable_return_routed_experts:
+                raise ValueError(
+                    "`step_wise_trajectories` doesn't support "
+                    "`generator.inference_engine.enable_return_routed_experts=True`. A step's routes are "
+                    "recorded for its generated tokens only, while its row's prompt is the whole history so "
+                    "far, so they would replay onto the first N prompt tokens of the row with no length "
+                    "mismatch to assert on."
+                )
+
+        ie_cfg = generator_cfg.inference_engine
+
+        if ie_cfg.enable_return_routed_experts and not self.use_conversation_multi_turn:
+            raise ValueError(
+                "`generator.inference_engine.enable_return_routed_experts=True` requires "
+                "`generator.use_conversation_multi_turn=True`. With `use_conversation_multi_turn=False` the "
+                "agent loop appends a synthetic EOS that is loss-active but that the inference engine never "
+                "evaluated, so the routed-expert trace holds no row for it and refuses to dummy-pad a "
+                "loss-active target."
+            )
+
+        if self.custom_chat_template is not None:
+            if ie_cfg.enable_return_routed_experts:
+                raise ValueError(
+                    "`generator.inference_engine.enable_return_routed_experts=True` is not compatible with a "
+                    f"custom chat template, got {generator_cfg.chat_template}. Retokenizing the chat history "
+                    "breaks token-in-token-out, so per-token routes no longer align with the response tokens."
+                )
+            if ie_cfg.enable_return_sample_support_set:
+                raise ValueError(
+                    "`generator.inference_engine.enable_return_sample_support_set=True` is not compatible with a "
+                    f"custom chat template, got {generator_cfg.chat_template}. Retokenizing the chat history "
+                    "breaks token-in-token-out, so per-token support rows no longer align with the response "
+                    "tokens."
+                )
 
     async def _run_in_executor_if_available(self, func, *args, **kwargs):
         if (executor := self.env_executor) is not None:
@@ -257,6 +312,23 @@ class SkyRLGymGenerator(GeneratorInterface):
         """
         return agent_loop_output
 
+    def _compute_cache_salt(self) -> Optional[str]:
+        """Derive a prefix-cache salt from the current policy version.
+
+        Returns a string keyed on the engine's ``weight_version`` (which advances on each weight sync)
+        and the policy model name (so distinct adapters / tenants don't collide). Called once per
+        ``generate`` batch so all trajectories share the version at the start of the batch. Returns
+        ``None`` when disabled or when the client exposes no weight version. We key on the engine's
+        weight version rather than ``global_step`` because in fully-async training they aren't in
+        lock-step.
+        """
+        if not self.generator_cfg.use_cache_salt:
+            return None
+        weight_version = getattr(self.inference_engine_client, "weight_version", None)
+        if weight_version is None:
+            return None
+        return build_vllm_cache_salt(weight_version, self.policy_model_name)
+
     async def agent_loop(
         self,
         prompt: ConversationType,
@@ -266,9 +338,15 @@ class SkyRLGymGenerator(GeneratorInterface):
         max_input_length: int,
         sampling_params: Optional[Dict[str, Any]] = None,
         trajectory_id: Optional[TrajectoryID] = None,
+        cache_salt: Optional[str] = None,
+        training_phase: TrainingPhase = TRAINING_PHASE_TRAIN,
     ) -> Union[TrajectoryOutput, StepWiseOutput]:
         """
         Multi-turn generation loop that executes a single trajectory.
+
+        The per-trajectory ``session_id`` is released via ``finish_session`` on
+        completion, error, or cancellation so session-aware routing policies can
+        free the replica capacity held by the trajectory.
 
         Note:
             We ensure token-in-token-out generation. With two exceptions:
@@ -292,283 +370,365 @@ class SkyRLGymGenerator(GeneratorInterface):
             prompt_token_ids: List[int]
             rollout_logprobs: Optional[List[float]]
         """
-        # NOTE: `custom_chat_template` was mainly for getting accurate loss masks for thinking models.
-        # This is no longer needed now given that step wise training is supported
-        # TODO (sumanthrh): This path can be deprecated
-        retokenize_chat_history = self.use_conversation_multi_turn and self.custom_chat_template
-
-        # Create a new environment instance
-        env_extras["max_turns"] = self.max_turns  # TODO(shu): move this to config
-        env_extras = self._setup_env_extras(env_class, env_extras, sampling_params, trajectory_id)
-
-        env_config = getattr(self.skyrl_gym_cfg, env_class, dict())
-        env = skyrl_gym.make(env_class, env_config=env_config, extras=env_extras)
+        agent_loop_start_time = time.monotonic()
+        time_splits = {"llm": 0.0, "env": 0.0}
 
         session_id = (
             f"{trajectory_id.instance_id}_{trajectory_id.repetition_id}" if trajectory_id is not None else uuid4().hex
         )
+        try:
+            # NOTE: `custom_chat_template` was mainly for getting accurate loss masks for thinking models.
+            # This is no longer needed now given that step wise training is supported
+            # TODO (sumanthrh): This path can be deprecated
+            retokenize_chat_history = self.use_conversation_multi_turn and self.custom_chat_template
 
-        # Instantiate chat_history and chat_end_index, which are only used if `retokenize_chat_history==True`.
-        # Need copy here since the prompt is a list of messages and we are going to modify it.
-        chat_history = copy.deepcopy(prompt)
+            # Create a new environment instance
+            env_extras["max_turns"] = self.max_turns  # TODO(shu): move this to config
+            env_extras = self._setup_env_extras(env_class, env_extras, sampling_params, trajectory_id)
 
-        # init() returns the first prompt to be given to the model, and optional metadata dict
-        chat_history, _ = await self._run_in_executor_if_available(env.init, chat_history)
-        initial_chat_history_length = len(chat_history)
-        initial_input_ids = self.tokenizer.apply_chat_template(
-            chat_history,
-            # If retokenize_chat_history==True, avoid including the generation prompt in both the
-            # prompt_ids and response_ids due to how `response_encodings["input_ids"]` works.
-            add_generation_prompt=not retokenize_chat_history,
-            chat_template=self.custom_chat_template if retokenize_chat_history else None,
-            tokenize=True,
-            return_dict=False,
-            **self.generator_cfg.chat_template_kwargs,
-        )
+            env_config = getattr(self.skyrl_gym_cfg, env_class, dict())
+            env = skyrl_gym.make(env_class, env_config=env_config, extras=env_extras)
 
-        initial_prompt_length = len(initial_input_ids)
-        loss_mask = []  # this excludes the prompt
-        rollout_logprobs = None
+            # Instantiate chat_history and chat_end_index, which are only used if `retokenize_chat_history==True`.
+            # Need copy here since the prompt is a list of messages and we are going to modify it.
+            chat_history = copy.deepcopy(prompt)
 
-        # `sampling_params` if provided is a dict in the format expected by the inference engine backend
-        # we cast default config to a dict for consistency
-        current_sampling_params: dict = (
-            sampling_params if sampling_params is not None else asdict(self.generator_cfg.sampling_params)
-        )
-
-        # Accumulate per-step rewards. Format: (reward, response_end_token_idx)
-        per_step_rewards: List[Tuple[float, Optional[int]]] = []
-
-        is_step_wise = self.generator_cfg.step_wise_trajectories
-
-        agent_loop_output = StepWiseOutput(step_outputs=[]) if is_step_wise else None
-
-        get_logprobs = self.generator_cfg.sampling_params.logprobs is not None
-        agent_loop_state = AgentLoopState(
-            chat_history=chat_history,
-            input_ids=initial_input_ids,
-            loss_mask=[],
-            rollout_logprobs=[] if get_logprobs else None,
-            response_end_idx=None,
-            done=False,
-        )
-
-        while not agent_loop_state.done:
-
-            if len(agent_loop_state.input_ids) > max_input_length:
-                stop_reason = "length"
-                break
-
-            # 1. Generate output
-            if is_step_wise or retokenize_chat_history:
-                # re-apply whole chat template so length check is correct
-                agent_loop_state.input_ids = self.tokenizer.apply_chat_template(
-                    chat_history,
-                    chat_template=self.custom_chat_template if retokenize_chat_history else None,
-                    add_generation_prompt=True,
-                    tokenize=True,
-                    return_dict=False,
-                    **self.generator_cfg.chat_template_kwargs,
-                )
-                agent_loop_state.loss_mask = []
-                agent_loop_state.rollout_logprobs = None
-
-            engine_input = InferenceEngineInput(
-                prompt_token_ids=[agent_loop_state.input_ids], session_ids=[session_id], sampling_params=sampling_params
-            )
-            engine_output = await self.inference_engine_client.generate(engine_input, model=self.policy_model_name)
-            output = engine_output["responses"][0]
-            output_ids = engine_output["response_ids"][0]
-            stop_reason = engine_output["stop_reasons"][0]
-            response_logprobs = engine_output.get("response_logprobs", None)
-            rollout_expert_indices = engine_output.get("rollout_expert_indices", None)
-            if response_logprobs is not None:
-                response_logprobs = response_logprobs[0]
-                if self.custom_chat_template is not None:
-                    raise ValueError("Response Logprobs bookkeeping is not supported with custom chat template")
-
-            if rollout_expert_indices is not None:
-                rollout_expert_indices = rollout_expert_indices[0]
-                if self.custom_chat_template is not None:
-                    raise ValueError("Rollout expert indices bookkeeping is not supported with custom chat template")
-            # Append eos when sampling_params.stop is not None. Does not affect 3.a as chat templates add eos_token.
-            # sampling_params is not None for eval, but None for training (which uses engine.sampling_params which are from cfg)
-            stop_strs = current_sampling_params.get("stop", None)
-            added_eos = False
-            if (
-                stop_strs is not None
-                and self.generator_cfg.append_eos_token_after_stop_str_in_multi_turn
-                and self.use_conversation_multi_turn
-            ):
-                if output.endswith(tuple(stop_strs)) and output_ids[-1] != self.tokenizer.eos_token_id:
-                    output_ids.append(self.tokenizer.eos_token_id)
-                    # dummy logprobs for EOS token id. It will be loss masked with 0 in TurnOutput.get_turn_loss_mask
-                    if response_logprobs is not None:
-                        response_logprobs.append(0.0)
-                    added_eos = True
-
-            # 2. Environment step
-            env_step_output: BaseTextEnvStepOutput = await self._run_in_executor_if_available(env.step, output)
-            new_obs = env_step_output["observations"]
-            step_reward: float = env_step_output["reward"]
-            agent_loop_state.done = env_step_output["done"]
-
-            if env_step_output.get("postprocessed_action", None) is not None:
-                # TODO(Charlie): come back to this, we should deprecate postprocessed action
-                logger.warning(
-                    "WARNING: postprocessed action may violate token-in-token-out. Ideally you "
-                    "post-process it in the token space rather than string space. "
-                    "A better solution coming soon."
-                )
-                output = env_step_output["postprocessed_action"]
-                output_ids = self.tokenizer.encode(output, add_special_tokens=False)
-
-            obs_ids = self.get_obs_ids_from_obs(new_obs, agent_loop_state.done)
-
-            # final turn output containing generated response and environment observations
-            turn_output = TurnOutput(
-                output=output,
-                output_ids=output_ids,
-                output_logprobs=response_logprobs,
-                new_obs=new_obs,
-                reward=step_reward,
-                obs_ids=obs_ids,
-                added_eos=added_eos,
-                rollout_expert_indices=rollout_expert_indices,
-            )
-
-            if turn_output.rollout_expert_indices is not None and agent_loop_state.rollout_expert_indices is None:
-                agent_loop_state.rollout_expert_indices = []
-
-            if is_step_wise:
-                # current response + observation ids
-                turn_response_ids = turn_output.output_ids + turn_output.obs_ids
-                turn_prompt_ids = agent_loop_state.input_ids
-
-                # agent loop only tracks loss mask and rollout logprobs for this turn with step_wise training
-                turn_loss_mask = turn_output.get_turn_loss_mask()
-                turn_response_logprobs: Optional[List[float]] = turn_output.get_turn_rollout_logprobs()
-
-                per_step_output = TrajectoryOutput(
-                    response_ids=turn_response_ids,
-                    reward=step_reward,
-                    loss_mask=turn_loss_mask,
-                    prompt_ids=turn_prompt_ids,
-                    rollout_logprobs=turn_response_logprobs,
-                    stop_reason=stop_reason,
-                    env_metrics=env.get_metrics() if agent_loop_state.done else {},
-                    rollout_expert_indices=turn_output.get_turn_rollout_expert_indices(),
-                )
-                agent_loop_output.step_outputs.append(per_step_output)
-
-            # 3. Update states: input ids, loss_mask, chat_history, etc.
-            # Three ways of managing input
-            if retokenize_chat_history:
-                # a. custom chat template
-                agent_loop_state = self._update_agent_state_by_retokenizing_chat_history(agent_loop_state, turn_output)
-            elif self.use_conversation_multi_turn:
-                # b. Token-in-token-out. Follow multi-turn chat history format.
-                agent_loop_state = self._update_agent_loop_state_with_multiturn_chat_template(
-                    agent_loop_state, turn_output
-                )
-            else:
-                # c. Token-in-token-out. All steps/observations are appended to a single assistant message.
-                agent_loop_state = self._update_agent_loop_state_with_singleturn_chat_template(
-                    agent_loop_state, turn_output
-                )
-
-            per_step_rewards.append((step_reward, agent_loop_state.response_end_idx))
-
-        # Get environment-specific metrics after the episode is done
-        env_metrics = env.get_metrics()
-        # Close the environment
-        await self._run_in_executor_if_available(env.close)
-
-        prompt_ids = agent_loop_state.input_ids[:initial_prompt_length]
-        rollout_logprobs = None
-        rollout_expert_indices_out = None
-        response_ids = None
-
-        # Prepare the final loss_mask, response_ids and rollout_logprobs .
-        # We remove the final observation messages /token IDs here
-        # Note that during the agent loop, we still add the final observation messages/ tokens because we terminate the agent loop if the input length
-        # exceeds the maximum
-        if retokenize_chat_history:
-            response_encodings = self.tokenizer.apply_chat_template(
-                agent_loop_state.chat_history[
-                    initial_chat_history_length : len(agent_loop_state.chat_history) - len(new_obs)
-                ],
-                chat_template=self.custom_chat_template,
-                add_generation_prompt=False,
-                return_dict=True,
-                return_assistant_tokens_mask=True,
+            # init() returns the first prompt to be given to the model, and optional metadata dict
+            chat_history, _ = await self._run_in_executor_if_available(env.init, chat_history)
+            initial_chat_history_length = len(chat_history)
+            initial_input_ids = self.tokenizer.apply_chat_template(
+                chat_history,
+                # If retokenize_chat_history==True, avoid including the generation prompt in both the
+                # prompt_ids and response_ids due to how `response_encodings["input_ids"]` works.
+                add_generation_prompt=not retokenize_chat_history,
+                chat_template=self.custom_chat_template if retokenize_chat_history else None,
                 tokenize=True,
+                return_dict=False,
                 **self.generator_cfg.chat_template_kwargs,
             )
-            loss_mask = response_encodings["assistant_masks"]
-            response_ids = response_encodings["input_ids"]
-        elif not self.generator_cfg.step_wise_trajectories:
-            assert not any(
-                agent_loop_state.loss_mask[agent_loop_state.response_end_idx - initial_prompt_length + 1 :]
-            ), "loss_mask at index after response end should be all 0"
-            loss_mask = agent_loop_state.loss_mask[: agent_loop_state.response_end_idx - initial_prompt_length + 1]
-            response_ids = agent_loop_state.input_ids[initial_prompt_length : agent_loop_state.response_end_idx + 1]
-            if agent_loop_state.rollout_logprobs is not None:
-                rollout_logprobs = agent_loop_state.rollout_logprobs[
-                    : agent_loop_state.response_end_idx - initial_prompt_length + 1
-                ]
-            if agent_loop_state.rollout_expert_indices is not None:
-                rollout_expert_indices_out = agent_loop_state.rollout_expert_indices[
-                    : agent_loop_state.response_end_idx + 1
-                ]
-            # fix index for per_step_rewards
-            per_step_rewards = [(reward, idx - initial_prompt_length) for reward, idx in per_step_rewards]
-            assert len(loss_mask) == len(
-                response_ids
-            ), f"loss_mask and response_ids should have the same length, got {len(loss_mask)} and {len(response_ids)}"
 
-        appended_eos_token = False
-        if not self.use_conversation_multi_turn:
-            assert response_ids is not None and loss_mask is not None
-            if stop_reason != "length" and response_ids and response_ids[-1] != self.tokenizer.eos_token_id:
-                response_ids.append(self.tokenizer.eos_token_id)
-                # TODO(Charlie): this should be 0? Otherwise logprobs will be extremely off. But if it is loss
-                # masked with 0, why bother adding it?
-                loss_mask.append(1)
-                if rollout_logprobs is not None:
-                    rollout_logprobs.append(0.0)
-                if rollout_expert_indices_out is not None and rollout_expert_indices_out:
-                    layer_num = len(rollout_expert_indices_out[0])
-                    topk = len(rollout_expert_indices_out[0][0]) if layer_num > 0 else 0
-                    rollout_expert_indices_out.append([[0] * topk for _ in range(layer_num)])
-                appended_eos_token = True
+            initial_prompt_length = len(initial_input_ids)
+            loss_mask = []  # this excludes the prompt
+            rollout_logprobs = None
 
-        if self.generator_cfg.step_wise_trajectories:
-            for per_step_output, (reward, resp_end_idx) in zip(agent_loop_output.step_outputs, per_step_rewards):
-                per_token_reward = [0.0] * len(per_step_output.response_ids)
-                per_token_reward[resp_end_idx] = float(reward)
-                # in-place update to per-token reward
-                per_step_output.reward = per_token_reward
-        else:
-            reward_out = self._build_per_token_rewards(per_step_rewards, response_ids, appended_eos_token)
-
-            agent_loop_output = TrajectoryOutput(
-                response_ids=response_ids,
-                reward=reward_out,
-                stop_reason=stop_reason,
-                loss_mask=loss_mask,
-                prompt_ids=prompt_ids,
-                rollout_logprobs=rollout_logprobs,
-                env_metrics=env_metrics,
-                rollout_expert_indices=rollout_expert_indices_out,
+            # `sampling_params` if provided is a dict in the format expected by the inference engine backend
+            # we cast default config to a dict for consistency
+            current_sampling_params: dict = (
+                sampling_params if sampling_params is not None else asdict(self.generator_cfg.sampling_params)
+            )
+            # Eval uses unbounded top-k sampling and opts out of capture.
+            capture_sample_support = (
+                self.generator_cfg.inference_engine.enable_return_sample_support_set
+                and training_phase != TRAINING_PHASE_EVAL
+            )
+            # Eval trajectories do not consume routed-expert indices.
+            capture_routed_experts = (
+                self.generator_cfg.inference_engine.enable_return_routed_experts
+                and training_phase != TRAINING_PHASE_EVAL
             )
 
-        agent_loop_output = self._post_process_agent_loop_output(
-            agent_loop_output,
-            env_extras,
-            trajectory_id,
-        )
-        return agent_loop_output
+            # Accumulate per-step rewards. Format: (reward, response_end_token_idx)
+            per_step_rewards: List[Tuple[float, Optional[int]]] = []
+            final_observation_token_count = 0
+
+            is_step_wise = self.generator_cfg.step_wise_trajectories
+
+            agent_loop_output = StepWiseOutput(step_outputs=[]) if is_step_wise else None
+
+            get_logprobs = current_sampling_params.get("logprobs", None) is not None
+            agent_loop_state = AgentLoopState(
+                chat_history=chat_history,
+                input_ids=initial_input_ids,
+                loss_mask=[],
+                rollout_logprobs=[] if get_logprobs else None,
+                response_end_idx=None,
+                done=False,
+                routed_expert_trace=RoutedExpertTrace() if capture_routed_experts else None,
+                sample_support_trace=SampleSupportTrace() if capture_sample_support and not is_step_wise else None,
+            )
+
+            while not agent_loop_state.done:
+
+                if len(agent_loop_state.input_ids) > max_input_length:
+                    stop_reason = "length"
+                    break
+
+                # 1. Generate output
+                if is_step_wise or retokenize_chat_history:
+                    # re-apply whole chat template so length check is correct
+                    agent_loop_state.input_ids = self.tokenizer.apply_chat_template(
+                        chat_history,
+                        chat_template=self.custom_chat_template if retokenize_chat_history else None,
+                        add_generation_prompt=True,
+                        tokenize=True,
+                        return_dict=False,
+                        **self.generator_cfg.chat_template_kwargs,
+                    )
+                    agent_loop_state.loss_mask = []
+                    agent_loop_state.rollout_logprobs = None
+
+                routed_expert_trace = agent_loop_state.routed_expert_trace
+                engine_input = InferenceEngineInput(
+                    prompt_token_ids=[agent_loop_state.input_ids],
+                    session_ids=[session_id],
+                    sampling_params=sampling_params,
+                    cache_salt=cache_salt,
+                    routed_experts_prompt_starts=[routed_expert_trace.prompt_start] if routed_expert_trace else None,
+                    return_sample_support=capture_sample_support,
+                )
+                llm_call_start_time = time.monotonic()
+                engine_output = await self.inference_engine_client.generate(engine_input, model=self.policy_model_name)
+                time_splits["llm"] += time.monotonic() - llm_call_start_time
+                output = engine_output["responses"][0]
+                output_ids = engine_output["response_ids"][0]
+                stop_reason = engine_output["stop_reasons"][0]
+                response_logprobs = engine_output.get("response_logprobs", None)
+                rollout_expert_indices = engine_output.get("rollout_expert_indices", None)
+                if response_logprobs is not None:
+                    response_logprobs = response_logprobs[0]
+                    if self.custom_chat_template is not None:
+                        raise ValueError("Response Logprobs bookkeeping is not supported with custom chat template")
+
+                if rollout_expert_indices is not None:
+                    rollout_expert_indices = rollout_expert_indices[0]
+                    assert (
+                        self.custom_chat_template is None
+                    ), "Rollout expert indices bookkeeping is not supported with custom chat template"
+                if routed_expert_trace is not None:
+                    if rollout_expert_indices is None:
+                        raise ValueError("R3 generation did not return routed expert indices")
+                    routed_expert_trace.record_generation(
+                        prompt_token_count=len(agent_loop_state.input_ids),
+                        generated_token_count=len(output_ids),
+                        routed_experts=rollout_expert_indices,
+                    )
+
+                sample_support_rows = None
+                if capture_sample_support:
+                    assert (
+                        self.custom_chat_template is None
+                    ), "Sample-support bookkeeping is not supported with custom chat template"
+                    raw_sample_support = engine_output.get("rollout_sample_support", None)
+                    if raw_sample_support is None:
+                        raise ValueError("Sample-support generation did not return a support set")
+                    sample_support_rows = raw_sample_support[0]
+                    if len(sample_support_rows) != len(output_ids):
+                        raise ValueError(
+                            f"Sample support has {len(sample_support_rows)} rows for {len(output_ids)} tokens"
+                        )
+                # Append eos when sampling_params.stop is not None. Does not affect 3.a as chat templates add eos_token.
+                # sampling_params is not None for eval, but None for training (which uses engine.sampling_params which are from cfg)
+                stop_strs = current_sampling_params.get("stop", None)
+                added_eos = False
+                if (
+                    stop_strs is not None
+                    and self.generator_cfg.append_eos_token_after_stop_str_in_multi_turn
+                    and self.use_conversation_multi_turn
+                ):
+                    if output.endswith(tuple(stop_strs)) and output_ids[-1] != self.tokenizer.eos_token_id:
+                        output_ids.append(self.tokenizer.eos_token_id)
+                        # dummy logprobs for EOS token id. It will be loss masked with 0 in TurnOutput.get_turn_loss_mask
+                        if response_logprobs is not None:
+                            response_logprobs.append(0.0)
+                        added_eos = True
+
+                # 2. Environment step
+                env_step_start_time = time.monotonic()
+                env_step_output: BaseTextEnvStepOutput = await self._run_in_executor_if_available(env.step, output)
+                time_splits["env"] += time.monotonic() - env_step_start_time
+                new_obs = env_step_output["observations"]
+                step_reward: float = env_step_output["reward"]
+                agent_loop_state.done = env_step_output["done"]
+
+                if env_step_output.get("postprocessed_action", None) is not None:
+                    # TODO(Charlie): come back to this, we should deprecate postprocessed action
+                    logger.warning(
+                        "WARNING: postprocessed action may violate token-in-token-out. Ideally you "
+                        "post-process it in the token space rather than string space. "
+                        "A better solution coming soon."
+                    )
+                    output = env_step_output["postprocessed_action"]
+                    output_ids = self.tokenizer.encode(output, add_special_tokens=False)
+                    if routed_expert_trace is not None:
+                        raise ValueError("R3 bookkeeping is incompatible with postprocessed_action")
+                    if sample_support_rows is not None:
+                        raise ValueError("Sample-support bookkeeping is incompatible with postprocessed_action")
+
+                obs_ids = self.get_obs_ids_from_obs(new_obs, agent_loop_state.done)
+
+                # final turn output containing generated response and environment observations
+                turn_output = TurnOutput(
+                    output=output,
+                    output_ids=output_ids,
+                    output_logprobs=response_logprobs,
+                    new_obs=new_obs,
+                    reward=step_reward,
+                    obs_ids=obs_ids,
+                    rollout_sample_support=sample_support_rows,
+                    added_eos=added_eos,
+                )
+
+                if is_step_wise:
+                    # current response + observation ids
+                    turn_response_ids = turn_output.output_ids + turn_output.obs_ids
+                    turn_prompt_ids = agent_loop_state.input_ids
+
+                    # agent loop only tracks loss mask and rollout logprobs for this turn with step_wise training
+                    turn_loss_mask = turn_output.get_turn_loss_mask()
+                    turn_response_logprobs: Optional[List[float]] = turn_output.get_turn_rollout_logprobs()
+                    turn_sample_support = turn_output.get_turn_rollout_sample_support()
+
+                    per_step_output = TrajectoryOutput(
+                        response_ids=turn_response_ids,
+                        reward=step_reward,
+                        loss_mask=turn_loss_mask,
+                        prompt_ids=turn_prompt_ids,
+                        rollout_logprobs=turn_response_logprobs,
+                        stop_reason=stop_reason,
+                        env_metrics=env.get_metrics() if agent_loop_state.done else {},
+                        rollout_sample_support=turn_sample_support,
+                    )
+                    agent_loop_output.step_outputs.append(per_step_output)
+
+                # 3. Update states: input ids, loss_mask, chat_history, etc.
+                # Three ways of managing input
+                sample_support_trace = agent_loop_state.sample_support_trace
+                support_rows_before = sample_support_trace.num_rows if sample_support_trace is not None else 0
+                input_length_before = len(agent_loop_state.input_ids)
+                if retokenize_chat_history:
+                    # a. custom chat template
+                    agent_loop_state = self._update_agent_state_by_retokenizing_chat_history(
+                        agent_loop_state, turn_output
+                    )
+                elif self.use_conversation_multi_turn:
+                    # b. Token-in-token-out. Follow multi-turn chat history format.
+                    agent_loop_state = self._update_agent_loop_state_with_multiturn_chat_template(
+                        agent_loop_state, turn_output
+                    )
+                else:
+                    # c. Token-in-token-out. All steps/observations are appended to a single assistant message.
+                    agent_loop_state = self._update_agent_loop_state_with_singleturn_chat_template(
+                        agent_loop_state, turn_output
+                    )
+
+                if sample_support_trace is not None:
+                    # Each appended token must contribute one support row.
+                    support_rows_added = sample_support_trace.num_rows - support_rows_before
+                    tokens_added = len(agent_loop_state.input_ids) - input_length_before
+                    assert support_rows_added == tokens_added, (
+                        f"sample-support trace advanced {support_rows_added} rows for {tokens_added} tokens "
+                        f"appended by this turn"
+                    )
+                # The trace covers this observation, which the response never keeps.
+                final_observation_token_count = len(turn_output.obs_ids)
+
+                per_step_rewards.append((step_reward, agent_loop_state.response_end_idx))
+
+            # Get environment-specific metrics after the episode is done
+            env_metrics = env.get_metrics()
+            # Close the environment
+            await self._run_in_executor_if_available(env.close)
+
+            prompt_ids = agent_loop_state.input_ids[:initial_prompt_length]
+            rollout_logprobs = None
+            rollout_expert_indices_out = None
+            rollout_sample_support_out = None
+            response_ids = None
+
+            # Prepare the final loss_mask, response_ids and rollout_logprobs .
+            # We remove the final observation messages /token IDs here
+            # Note that during the agent loop, we still add the final observation messages/ tokens because we terminate the agent loop if the input length
+            # exceeds the maximum
+            if retokenize_chat_history:
+                response_encodings = self.tokenizer.apply_chat_template(
+                    agent_loop_state.chat_history[
+                        initial_chat_history_length : len(agent_loop_state.chat_history) - len(new_obs)
+                    ],
+                    chat_template=self.custom_chat_template,
+                    add_generation_prompt=False,
+                    return_dict=True,
+                    return_assistant_tokens_mask=True,
+                    tokenize=True,
+                    **self.generator_cfg.chat_template_kwargs,
+                )
+                loss_mask = response_encodings["assistant_masks"]
+                response_ids = response_encodings["input_ids"]
+            elif not self.generator_cfg.step_wise_trajectories:
+                assert not any(
+                    agent_loop_state.loss_mask[agent_loop_state.response_end_idx - initial_prompt_length + 1 :]
+                ), "loss_mask at index after response end should be all 0"
+                loss_mask = agent_loop_state.loss_mask[: agent_loop_state.response_end_idx - initial_prompt_length + 1]
+                response_ids = agent_loop_state.input_ids[initial_prompt_length : agent_loop_state.response_end_idx + 1]
+                if agent_loop_state.rollout_logprobs is not None:
+                    rollout_logprobs = agent_loop_state.rollout_logprobs[
+                        : agent_loop_state.response_end_idx - initial_prompt_length + 1
+                    ]
+                # fix index for per_step_rewards
+                per_step_rewards = [(reward, idx - initial_prompt_length) for reward, idx in per_step_rewards]
+                assert len(loss_mask) == len(
+                    response_ids
+                ), f"loss_mask and response_ids should have the same length, got {len(loss_mask)} and {len(response_ids)}"
+
+            appended_eos_token = False
+            if not self.use_conversation_multi_turn:
+                assert response_ids is not None and loss_mask is not None
+                if stop_reason != "length" and response_ids and response_ids[-1] != self.tokenizer.eos_token_id:
+                    response_ids.append(self.tokenizer.eos_token_id)
+                    loss_mask.append(1)
+                    if rollout_logprobs is not None:
+                        rollout_logprobs.append(0.0)
+                    if agent_loop_state.sample_support_trace is not None:
+                        # Restore support for a sampled EOS; a synthetic EOS remains padding.
+                        dropped_row = agent_loop_state.dropped_eos_sample_support
+                        if dropped_row is not None:
+                            agent_loop_state.sample_support_trace.append(dropped_row, expected_rows=1)
+                        else:
+                            agent_loop_state.sample_support_trace.append_padding(1)
+                    appended_eos_token = True
+
+            if agent_loop_state.routed_expert_trace is not None and agent_loop_state.routed_expert_trace.prompt_start:
+                rollout_expert_indices_out = agent_loop_state.routed_expert_trace.finalize(
+                    token_count=len(prompt_ids) + len(response_ids),
+                    loss_mask=[0] * len(prompt_ids) + loss_mask,
+                )
+            if agent_loop_state.sample_support_trace is not None and agent_loop_state.sample_support_trace.num_rows:
+                rollout_sample_support_out = agent_loop_state.sample_support_trace.finalize(
+                    token_count=len(response_ids),
+                    extra_rows=final_observation_token_count,
+                )
+
+            if self.generator_cfg.step_wise_trajectories:
+                for per_step_output, (reward, resp_end_idx) in zip(agent_loop_output.step_outputs, per_step_rewards):
+                    per_token_reward = [0.0] * len(per_step_output.response_ids)
+                    per_token_reward[resp_end_idx] = float(reward)
+                    # in-place update to per-token reward
+                    per_step_output.reward = per_token_reward
+            else:
+                reward_out = self._build_per_token_rewards(per_step_rewards, response_ids, appended_eos_token)
+
+                agent_loop_output = TrajectoryOutput(
+                    response_ids=response_ids,
+                    reward=reward_out,
+                    stop_reason=stop_reason,
+                    loss_mask=loss_mask,
+                    prompt_ids=prompt_ids,
+                    rollout_logprobs=rollout_logprobs,
+                    env_metrics=env_metrics,
+                    rollout_expert_indices=rollout_expert_indices_out,
+                    rollout_sample_support=rollout_sample_support_out,
+                )
+
+            agent_loop_output = self._post_process_agent_loop_output(
+                agent_loop_output,
+                env_extras,
+                trajectory_id,
+            )
+            agent_loop_output.e2e_time = time.monotonic() - agent_loop_start_time
+            agent_loop_output.time_splits = time_splits
+            return agent_loop_output
+
+        finally:
+            await self.inference_engine_client.finish_session(session_id)
 
     def _build_per_token_rewards(
         self, per_step_rewards: List[Tuple[float, Optional[int]]], response_ids: List[int], appended_eos_token: bool
@@ -682,6 +842,8 @@ class SkyRLGymGenerator(GeneratorInterface):
         env_extras: List[Dict[str, Any]],
         max_tokens: int,
         sampling_params: Optional[Dict[str, Any]] = None,
+        cache_salt: Optional[str] = None,
+        training_phase: TrainingPhase = TRAINING_PHASE_TRAIN,
     ) -> GeneratorOutput:
         """
         Single-turn batched generation (can use the synchronous offline engine)
@@ -713,20 +875,39 @@ class SkyRLGymGenerator(GeneratorInterface):
             tokenize=True,
             return_dict=False,
         )
-        engine_input = InferenceEngineInput(prompt_token_ids=prompt_token_ids, sampling_params=sampling_params)
+        # Eval batches do not capture per-token side channels.
+        capture_sample_support = (
+            self.generator_cfg.inference_engine.enable_return_sample_support_set
+            and training_phase != TRAINING_PHASE_EVAL
+        )
+        capture_routed_experts = (
+            self.generator_cfg.inference_engine.enable_return_routed_experts and training_phase != TRAINING_PHASE_EVAL
+        )
+        engine_input = InferenceEngineInput(
+            prompt_token_ids=prompt_token_ids,
+            sampling_params=sampling_params,
+            return_sample_support=capture_sample_support,
+            cache_salt=cache_salt,
+        )
         engine_output = await self.inference_engine_client.generate(engine_input, model=self.policy_model_name)
         outputs = engine_output["responses"]
         responses = engine_output["response_ids"]
         stop_reasons = engine_output["stop_reasons"]
         logprobs = engine_output.get("response_logprobs", None)
-        raw_rollout_expert_indices = engine_output.get("rollout_expert_indices", None)
+        raw_rollout_expert_indices = (
+            engine_output.get("rollout_expert_indices", None) if capture_routed_experts else None
+        )
+        raw_rollout_sample_support = engine_output.get("rollout_sample_support", None)
 
         truncated_responses = []
         rewards = []
         loss_masks = []
         env_metrics = []
         truncated_logprobs: Optional[List[List[float]]] = [] if logprobs is not None else None
-        truncated_indices: Optional[List] = [] if raw_rollout_expert_indices is not None else None
+        truncated_indices: Optional[List[RoutedExpertIndices]] = [] if raw_rollout_expert_indices is not None else None
+        truncated_sample_support: Optional[List[CompactSampleSupport]] = (
+            [] if raw_rollout_sample_support is not None else None
+        )
 
         for i, (output, response, env, env_class) in enumerate(zip(outputs, responses, envs, env_classes)):
             # step on environment and compute reward
@@ -745,13 +926,15 @@ class SkyRLGymGenerator(GeneratorInterface):
                 sample_indices = raw_rollout_expert_indices[i]
                 prompt_len = len(prompt_token_ids[i])
                 truncated_indices.append(sample_indices[: prompt_len + len(response)])
+            if raw_rollout_sample_support is not None:
+                truncated_sample_support.append(raw_rollout_sample_support[i][: len(response)])
 
             # Get environment-specific metrics
             env_metrics.append(env.get_metrics())
             # Close the environment
             await self._run_in_executor_if_available(env.close)
 
-        rollout_metrics = get_rollout_metrics(responses, rewards, env_metrics, env_classes, loss_masks)
+        rollout_metrics = get_rollout_metrics(truncated_responses, rewards, env_metrics, env_classes, loss_masks)
 
         if self.generator_cfg.apply_overlong_filtering:
             # set loss mask to 0 if the stop reason is not "stop"
@@ -766,6 +949,7 @@ class SkyRLGymGenerator(GeneratorInterface):
             "rollout_metrics": rollout_metrics,
             "rollout_logprobs": truncated_logprobs,
             "rollout_expert_indices": truncated_indices,
+            "rollout_sample_support": truncated_sample_support,
         }
 
         return generator_output
@@ -789,10 +973,33 @@ class SkyRLGymGenerator(GeneratorInterface):
             assert trajectory_ids is not None, "`trajectory_ids` is a required field for step wise training"
         sampling_params: Optional[dict] = input_batch.get("sampling_params", None)
         max_tokens = self.generator_cfg.sampling_params.max_generate_length
+        # Per-request sampling params (e.g. eval's `eval_sampling_params`) carry their own generation budget; without
+        # this, eval responses longer than the TRAIN max_generate_length are cut in the stored ids/length metrics
+        # (the reward is still computed on the full engine output).
+        if sampling_params is not None and sampling_params.get("max_tokens") is not None:
+            max_tokens = sampling_params["max_tokens"]
         max_input_length = self.generator_cfg.max_input_length
 
+        # Prefix-cache salt derived from the engine weight version. Captured once per `generate` call so
+        # every trajectory in this batch shares one salt (the policy version at the start of the batch).
+        cache_salt = self._compute_cache_salt()
+
+        # The phase controls per-request sample-support capture.
+        batch_metadata = input_batch.get("batch_metadata", None)
+        training_phase: TrainingPhase = (
+            batch_metadata.training_phase if batch_metadata is not None else TRAINING_PHASE_TRAIN
+        )
+
         if self.batched:
-            return await self.generate_batched(prompts, env_classes, env_extras, max_tokens, sampling_params)
+            return await self.generate_batched(
+                prompts,
+                env_classes,
+                env_extras,
+                max_tokens,
+                sampling_params,
+                cache_salt=cache_salt,
+                training_phase=training_phase,
+            )
 
         # Async agent loop to generate trajectories in parallel.
         tasks = []
@@ -806,6 +1013,8 @@ class SkyRLGymGenerator(GeneratorInterface):
                     max_input_length,
                     sampling_params=sampling_params,
                     trajectory_id=trajectory_ids[i] if trajectory_ids is not None else None,
+                    cache_salt=cache_salt,
+                    training_phase=training_phase,
                 )
             )
 
@@ -816,6 +1025,13 @@ class SkyRLGymGenerator(GeneratorInterface):
             mininterval=5,
             disable=disable_tqdm,
         )
+        # Per-trajectory end-to-end generation times (one entry per prompt, preserving input order).
+        # ``e2e_time`` is optional for agent loops; if any trajectory did not record it, we omit the
+        # field entirely rather than emit a partially-populated list.
+        trajectory_generation_times_per_prompt = [getattr(output, "e2e_time", None) for output in all_outputs]
+        if any(t is None for t in trajectory_generation_times_per_prompt):
+            trajectory_generation_times_per_prompt = None
+        trajectory_time_splits_per_prompt = _split_lists([getattr(o, "time_splits", None) for o in all_outputs])
 
         if self.generator_cfg.step_wise_trajectories:
             responses = []
@@ -827,6 +1043,8 @@ class SkyRLGymGenerator(GeneratorInterface):
             is_last_step = []
             out_trajectory_ids = []
             out_env_classes = []
+            out_trajectory_generation_times = []
+            out_step_time_splits = []
             for i, output in enumerate(all_outputs):
                 for j, step_output in enumerate(output.step_outputs):
                     responses.append(step_output.response_ids)
@@ -838,6 +1056,13 @@ class SkyRLGymGenerator(GeneratorInterface):
                     is_last_step.append(j == len(output.step_outputs) - 1)
                     out_trajectory_ids.append(trajectory_ids[i])
                     out_env_classes.append(env_classes[i])
+                    # For trajectory completion per turn we just use the trajectory level times
+                    out_trajectory_generation_times.append(getattr(output, "e2e_time", None))
+                    out_step_time_splits.append(getattr(output, "time_splits", None))
+            # Keep aligned with the per-prompt None handling:
+            if not trajectory_generation_times_per_prompt:
+                out_trajectory_generation_times = None
+            out_trajectory_time_splits = _split_lists(out_step_time_splits)
             env_classes = out_env_classes
         else:
             responses = [output.response_ids for output in all_outputs]
@@ -848,6 +1073,9 @@ class SkyRLGymGenerator(GeneratorInterface):
             env_metrics = [output.env_metrics for output in all_outputs]
             is_last_step = None
             out_trajectory_ids = None
+            # One time per trajectory, already aligned 1:1 with responses (None if not all recorded).
+            out_trajectory_generation_times = trajectory_generation_times_per_prompt
+            out_trajectory_time_splits = trajectory_time_splits_per_prompt
 
         has_vision_features = any(getattr(output, "pixel_values", None) is not None for output in all_outputs)
         pixel_values = (
@@ -874,12 +1102,36 @@ class SkyRLGymGenerator(GeneratorInterface):
         else:
             rollout_logprobs = None
 
-        if self.generator_cfg.inference_engine.enable_return_routed_experts:
-            rollout_expert_indices = [output.rollout_expert_indices for output in all_outputs]
+        if self.generator_cfg.step_wise_trajectories:
+            expert_indices_values = [None] * len(responses)
         else:
-            rollout_expert_indices = None
+            expert_indices_values = [output.rollout_expert_indices for output in all_outputs]
+        # Preserve None when no trajectory contains routes.
+        rollout_expert_indices = (
+            expert_indices_values if any(value is not None for value in expert_indices_values) else None
+        )
 
-        rollout_metrics = get_rollout_metrics(responses, rewards, env_metrics, env_classes, loss_masks)
+        if self.generator_cfg.step_wise_trajectories:
+            sample_support_values = [
+                step_output.rollout_sample_support for output in all_outputs for step_output in output.step_outputs
+            ]
+        else:
+            sample_support_values = [output.rollout_sample_support for output in all_outputs]
+        rollout_sample_support = (
+            sample_support_values if any(value is not None for value in sample_support_values) else None
+        )
+
+        rollout_metrics = get_rollout_metrics(
+            responses,
+            rewards,
+            env_metrics,
+            env_classes,
+            loss_masks,
+            # NOTE: we only use trajectory completion times per prompt for
+            # metrics, to avoid duplicate entries with step-wise training
+            trajectory_completion_times=trajectory_generation_times_per_prompt,
+            trajectory_time_splits=trajectory_time_splits_per_prompt,
+        )
 
         if self.generator_cfg.zero_reward_on_non_stop:
             # set reward to 0 if the stop reason is not "stop"
@@ -898,7 +1150,11 @@ class SkyRLGymGenerator(GeneratorInterface):
             "rollout_metrics": rollout_metrics,
             "rollout_logprobs": rollout_logprobs,
             "trajectory_ids": out_trajectory_ids,
+            # NOTE: for completion metrics, we output the completion time
+            "trajectory_generation_times": out_trajectory_generation_times,
+            "trajectory_time_splits": out_trajectory_time_splits,
             "rollout_expert_indices": rollout_expert_indices,
+            "rollout_sample_support": rollout_sample_support,
             "is_last_step": is_last_step,
             "env_metrics": env_metrics,
         }
@@ -960,6 +1216,13 @@ class SkyRLGymGenerator(GeneratorInterface):
         """
         assert self.use_conversation_multi_turn and self.custom_chat_template
 
+        if agent_loop_state.routed_expert_trace is not None or agent_loop_state.sample_support_trace is not None:
+            raise NotImplementedError(
+                "retokenizing the chat history does not feed the per-token side-channel traces, so routes and "
+                "sample support would not align with the retokenized response. `generator.chat_template` is "
+                "refused with `enable_return_routed_experts` and `enable_return_sample_support_set`."
+            )
+
         agent_loop_state.chat_history = self._update_chat_history(
             agent_loop_state.chat_history, turn_output.output, turn_output.new_obs
         )
@@ -970,8 +1233,6 @@ class SkyRLGymGenerator(GeneratorInterface):
         agent_loop_state.response_end_idx = None
         # `logprobs` are not computed because retokenizing breaks token-in-token-out
         agent_loop_state.rollout_logprobs = None
-        # indices are not meaningful when retokenizing
-        agent_loop_state.rollout_expert_indices = None
         return agent_loop_state
 
     def _update_agent_loop_state_with_multiturn_chat_template(
@@ -1023,17 +1284,12 @@ class SkyRLGymGenerator(GeneratorInterface):
         loss_mask_for_turn = turn_output.get_turn_loss_mask()
         rollout_logprobs_for_turn = turn_output.get_turn_rollout_logprobs()
 
-        # use the raw rollout expert indices without any appending of observation tokens
-        # this will be overwritten each turn, so we don't need to append observation tokens to it
-        rollout_expert_indices_for_turn = turn_output.rollout_expert_indices
-
         if self.generator_cfg.step_wise_trajectories:
             # cumulative input_ids is not tracked for step wise training
             agent_loop_state.response_end_idx = len(turn_output.output_ids) - 1
-            # no running loss_mask, `rollout_logprobs`, or `rollout_expert_indices` are tracked for step-wise training
+            # no running loss_mask or rollout logprobs are tracked for step-wise training
             agent_loop_state.loss_mask = None
             agent_loop_state.rollout_logprobs = None
-            agent_loop_state.rollout_expert_indices = None
         else:
             # Directly append turn output
             turn_ids = turn_output.output_ids + turn_output.obs_ids
@@ -1042,11 +1298,9 @@ class SkyRLGymGenerator(GeneratorInterface):
             agent_loop_state.loss_mask += loss_mask_for_turn
             if agent_loop_state.rollout_logprobs is not None and rollout_logprobs_for_turn is not None:
                 agent_loop_state.rollout_logprobs += rollout_logprobs_for_turn
-            if agent_loop_state.rollout_expert_indices is not None and rollout_expert_indices_for_turn is not None:
-                # overwrite the existing rollout inference indices, since the inference engine should
-                # return the expert indices for the entire sequence including each turn's input
-                # and the final response should not have an observation appended to it
-                agent_loop_state.rollout_expert_indices = rollout_expert_indices_for_turn
+            turn_sample_support = turn_output.get_turn_rollout_sample_support()
+            if agent_loop_state.sample_support_trace is not None and turn_sample_support is not None:
+                agent_loop_state.sample_support_trace.append(turn_sample_support, expected_rows=len(turn_ids))
 
         return agent_loop_state
 
@@ -1098,8 +1352,15 @@ class SkyRLGymGenerator(GeneratorInterface):
 
         # Remove EOS token from response tokens since we are continuing the current assistant message
         new_resp_tokens = turn_output.output_ids.copy()
-        if new_resp_tokens and new_resp_tokens[-1] == self.tokenizer.eos_token_id:
+        dropped_eos = bool(new_resp_tokens) and new_resp_tokens[-1] == self.tokenizer.eos_token_id
+        if dropped_eos:
             new_resp_tokens = new_resp_tokens[:-1]
+        # Keep the sliced EOS token's support row so the trajectory's re-appended EOS can carry it.
+        agent_loop_state.dropped_eos_sample_support = (
+            turn_output.rollout_sample_support[len(new_resp_tokens) : len(new_resp_tokens) + 1]
+            if dropped_eos and turn_output.rollout_sample_support is not None
+            else None
+        )
 
         turn_ids = new_resp_tokens + obs_ids_to_add
         loss_mask_for_turn = [1] * len(new_resp_tokens) + [0] * len(obs_ids_to_add)
@@ -1117,13 +1378,10 @@ class SkyRLGymGenerator(GeneratorInterface):
         agent_loop_state.loss_mask += loss_mask_for_turn
         if agent_loop_state.rollout_logprobs is not None and rollout_logprobs_for_turn is not None:
             agent_loop_state.rollout_logprobs += rollout_logprobs_for_turn
-        if (
-            self.generator_cfg.inference_engine.enable_return_routed_experts
-            and turn_output.rollout_expert_indices is not None
-        ):
-            # overwrite the existing rollout inference indices, since the inference engine should
-            # return the expert indices for the entire sequence including each turn's input and observation tokens
-            # and the final response should not have an observation appended to it
-            agent_loop_state.rollout_expert_indices = turn_output.rollout_expert_indices
-
+        if agent_loop_state.sample_support_trace is not None and turn_output.rollout_sample_support is not None:
+            # A dropped EOS shortens the generated run, so slice rather than reuse the turn's padding.
+            agent_loop_state.sample_support_trace.append(
+                turn_output.rollout_sample_support[: len(new_resp_tokens)], expected_rows=len(new_resp_tokens)
+            )
+            agent_loop_state.sample_support_trace.append_padding(len(obs_ids_to_add))
         return agent_loop_state

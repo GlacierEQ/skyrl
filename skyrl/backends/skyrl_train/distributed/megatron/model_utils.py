@@ -16,11 +16,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import warnings
+from math import prod
 from typing import Any, Optional
 
 import megatron.core.parallel_state as mpu
 import torch
 import torch.distributed as dist
+
+from skyrl.backends.skyrl_train.utils.packed_tensor import lengths_from_offsets
+from skyrl.train.fused_lm_head import FusedLmHeadBackend
 
 
 @torch.no_grad()
@@ -214,9 +219,15 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
         seq_size = int(vocab_parallel_logits.shape[1])
         num_chunks = (seq_size + chunk_size - 1) // chunk_size
 
-        all_grad_input = []
-
         batch_size = int(vocab_parallel_logits.shape[0])
+
+        # Stream chunk grads into a preallocated buffer instead of keeping every
+        # chunk alive until torch.cat. Each chunk owns one contiguous seq slice.
+        grad_input = torch.empty(
+            (batch_size, seq_size, partition_vocab_size),
+            dtype=torch.float32,
+            device=vocab_parallel_logits.device,
+        )
 
         for chunk_idx in range(num_chunks):
             chunk_start = chunk_idx * chunk_size
@@ -251,18 +262,339 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
             flat_chosen = flat_idx.masked_select(valid_mask.reshape(-1)) + chunk_masked_target.masked_select(valid_mask)
 
             # `neg` is zero-copy; the subsequent mul_ writes in place.
-            grad_input = softmax_output.neg_()
-            grad_input.mul_(chunk_grad_output.unsqueeze(-1))
+            chunk_grad_input = softmax_output.neg_()
+            chunk_grad_input.mul_(chunk_grad_output.unsqueeze(-1))
 
             grad_output_selected = chunk_grad_output.masked_select(valid_mask)
-            grad_input.view(-1).scatter_add_(0, flat_chosen, grad_output_selected)
+            chunk_grad_input.view(-1).scatter_add_(0, flat_chosen, grad_output_selected)
 
-            all_grad_input.append(grad_input)
-
-        grad_input = torch.cat(all_grad_input, dim=1)
+            # Write this chunk into its non-overlapping sequence slice.
+            grad_input[:, chunk_start:chunk_end, :] = chunk_grad_input
 
         # if you add an argument to the forward method, then you must add a corresponding None here
         return grad_input, None, None, None, None, None, None
+
+
+def _capped_chunk_logits(
+    logits: torch.Tensor, softcap: Optional[float], temperature: float
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Apply a final logit softcap, then the temperature, to fp32 chunk logits.
+
+    Returns ``(softcap * tanh(z / softcap) / temperature, tanh(z / softcap))``; backward needs the
+    tanh (``d/dz = (1 - tanh²) / temperature``). Without a softcap the callers fold the
+    temperature into the weight, and this returns ``(logits, None)``.
+    """
+    if softcap is None:
+        return logits, None
+    tanh = torch.tanh(logits / softcap)
+    return tanh * (softcap / temperature), tanh
+
+
+class FusedLinearChunkedDistributedLogprob(torch.autograd.Function):
+    """Fused LM-head + distributed token-logprob, chunked over the sequence.
+
+    This brings the Liger fused-linear-cross-entropy memory technique
+    (https://github.com/linkedin/Liger-Kernel) to Megatron RL: the per-token
+    log-prob is computed straight from the decoder ``hidden`` states and the
+    output-layer ``weight`` without ever building the logits. We generalize it
+    beyond Liger's stock kernel along two axes Liger does not cover — Megatron
+    **tensor/vocab + context parallelism** (the cross-rank max / sum-exp /
+    chosen-logit all-reduces) and **per-token log-probs** (Liger's FLCE only
+    supports reduction='mean'/'sum' in backward, not 'none').
+
+    Identical math to :class:`ChunkedDistributedLogprob`, but the output-layer
+    matmul ``logits = hidden @ weightᵀ`` is folded into the chunk loop so the
+    full ``[B, S, V//TP]`` logits tensor (and, in backward, its float32
+    gradient) is *never* materialized. Only ``hidden`` and ``weight`` are saved
+    for backward; per-chunk logits are recomputed. Peak memory for this op drops
+    from O(S · V//TP) to O(chunk · V//TP) + O(S · H), which is what makes
+    very long contexts (e.g. 262k) fit.
+
+    Args mirror ``ChunkedDistributedLogprob`` with ``vocab_parallel_logits``
+    replaced by ``(hidden, weight)``:
+        hidden: [B, S, H]                (decoder output, this CP/TP rank)
+        weight: [V//TP, H]               (output-layer weight, this TP rank)
+        target: [B, S]                   (already rolled by the caller)
+        softcap: final logit softcap (``softcap * tanh(logits / softcap)``, e.g. Beam), or None.
+        temperature: applied after the softcap; only used with a softcap (otherwise the caller
+            folds it into ``weight``).
+    """
+
+    @staticmethod
+    def forward(  # pyrefly: ignore[bad-override]
+        ctx: Any,
+        hidden: torch.Tensor,
+        weight: torch.Tensor,
+        target: torch.Tensor,
+        vocab_start_index: int,
+        vocab_end_index: int,
+        chunk_size: int,
+        tp_group: torch.distributed.ProcessGroup,
+        inference_only: bool = False,
+        compute_entropy: bool = False,
+        entropy_requires_grad: bool = False,
+        softcap: Optional[float] = None,
+        temperature: float = 1.0,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if entropy_requires_grad and not compute_entropy:
+            raise ValueError("entropy_requires_grad=True requires compute_entropy=True")
+        if entropy_requires_grad and inference_only:
+            raise ValueError("entropy gradients are unavailable with inference_only=True")
+        target_mask = (target < vocab_start_index) | (target >= vocab_end_index)
+        masked_target = target - vocab_start_index
+        masked_target[target_mask] = 0
+
+        seq_size = int(hidden.shape[1])
+        num_chunks = (seq_size + chunk_size - 1) // chunk_size
+        all_log_probs = []
+        all_entropy = []
+
+        for chunk_idx in range(num_chunks):
+            chunk_start = chunk_idx * chunk_size
+            chunk_end = min(seq_size, (chunk_idx + 1) * chunk_size)
+
+            # Fused output projection for this chunk only; cast to fp32 inside
+            # the loop so a full fp32 logits tensor is never materialized.
+            # Cast hidden to the weight dtype first (matches what the
+            # ColumnParallelLinear output layer does: hidden may be bf16 while
+            # the output weight is fp32, or vice versa).
+            logits = torch.matmul(hidden[:, chunk_start:chunk_end, :].to(weight.dtype), weight.t()).to(
+                dtype=torch.float32
+            )
+            logits, _ = _capped_chunk_logits(logits, softcap, temperature)
+
+            distributed_log_probs = _compute_distributed_log_softmax(logits, group=tp_group)
+            if compute_entropy:
+                entropy = -(distributed_log_probs.exp() * distributed_log_probs).sum(dim=-1)
+                torch.distributed.all_reduce(entropy, group=tp_group)
+                all_entropy.append(entropy)
+            selected_log_probs = torch.gather(
+                distributed_log_probs, -1, masked_target[:, chunk_start:chunk_end].unsqueeze(-1)
+            ).squeeze(-1)
+            selected_log_probs[target_mask[:, chunk_start:chunk_end]] = 0.0
+            all_log_probs.append(selected_log_probs)
+
+        # Defer the cross-TP combine to a single all_reduce over the full [B, S]
+        # log-prob tensor instead of one per chunk. Each rank holds the log-prob
+        # for targets in its own vocab shard (0 elsewhere), and SUM is
+        # associative across the sequence concat, so this is numerically
+        # identical to reducing per chunk while cutting the number of (blocking)
+        # collective calls from num_chunks to 1 (e.g. 256 -> 1 at S=262k,
+        # chunk=1024), removing the per-chunk launch/sync overhead.
+        log_probs = torch.cat(all_log_probs, dim=1)
+        torch.distributed.all_reduce(
+            log_probs,
+            op=torch.distributed.ReduceOp.SUM,
+            group=tp_group,
+        )
+
+        if not inference_only:
+            ctx.save_for_backward(hidden, weight, target_mask, masked_target)
+            ctx.chunk_size = chunk_size
+            ctx.tp_group = tp_group
+            ctx.entropy_requires_grad = entropy_requires_grad
+            ctx.softcap = softcap
+            ctx.temperature = temperature
+
+        if not compute_entropy:
+            return log_probs
+
+        entropy = torch.cat(all_entropy, dim=1)
+        if not entropy_requires_grad:
+            ctx.mark_non_differentiable(entropy)
+        return log_probs, entropy
+
+    @staticmethod
+    def backward(
+        ctx: Any,
+        *grad_outputs: torch.Tensor,
+    ) -> tuple[Optional[torch.Tensor], ...]:
+        grad_output = grad_outputs[0]
+        grad_entropy = grad_outputs[1] if ctx.entropy_requires_grad else None
+        hidden, weight, target_mask, masked_target = ctx.saved_tensors
+        chunk_size = ctx.chunk_size
+        tp_group = ctx.tp_group
+
+        partition_vocab_size = int(weight.shape[0])
+        hidden_size = int(weight.shape[1])
+        batch_size = int(hidden.shape[0])
+        seq_size = int(hidden.shape[1])
+        num_chunks = (seq_size + chunk_size - 1) // chunk_size
+
+        # grad_hidden has the same (small) [B, S, H] shape as the input; the
+        # weight grad is accumulated in fp32. The full [B, S, V//TP] logit grad
+        # is never built — each chunk's logit grad is immediately projected onto
+        # grad_hidden / grad_weight and then freed.
+        # A frozen output layer (LoRA, or any run that does not train the LM head) needs no
+        # weight gradient: skip the per-chunk [V//TP, H] GEMM and the fp32 accumulator.
+        compute_weight_grad = ctx.needs_input_grad[1]
+        grad_hidden = torch.empty_like(hidden)
+        grad_weight = (
+            torch.zeros((partition_vocab_size, hidden_size), dtype=torch.float32, device=weight.device)
+            if compute_weight_grad
+            else None
+        )
+
+        for chunk_idx in range(num_chunks):
+            chunk_start = chunk_idx * chunk_size
+            chunk_end = min(seq_size, (chunk_idx + 1) * chunk_size)
+            chunk_len = chunk_end - chunk_start
+
+            h_chunk = hidden[:, chunk_start:chunk_end, :]
+            logits = torch.matmul(h_chunk.to(weight.dtype), weight.t()).to(dtype=torch.float32)
+            logits, tanh = _capped_chunk_logits(logits, ctx.softcap, ctx.temperature)
+            distributed_log_probs = _compute_distributed_log_softmax(logits, group=tp_group)
+            if ctx.entropy_requires_grad:
+                softmax_output = distributed_log_probs.exp()
+                chunk_entropy = -(softmax_output * distributed_log_probs).sum(dim=-1)
+                torch.distributed.all_reduce(chunk_entropy, group=tp_group)
+            else:
+                softmax_output = distributed_log_probs.exp_()
+
+            # Same memory-efficient scatter-add fast path as
+            # ChunkedDistributedLogprob.backward, computing
+            # (one_hot(target) - softmax) * grad_output without materializing
+            # one_hot over the partition vocab.
+            chunk_target_mask = target_mask[:, chunk_start:chunk_end]
+            chunk_masked_target = masked_target[:, chunk_start:chunk_end]
+            chunk_grad_output = (
+                grad_output[:, chunk_start:chunk_end]
+                if grad_output is not None
+                else torch.zeros_like(softmax_output[..., 0])
+            )
+
+            row = torch.arange(batch_size, device=softmax_output.device).view(-1, 1).expand(-1, chunk_len).reshape(-1)
+            col = torch.arange(chunk_len, device=softmax_output.device).expand(batch_size, -1).reshape(-1)
+            flat_idx = (row * chunk_len + col) * partition_vocab_size
+
+            valid_mask = ~chunk_target_mask
+            flat_chosen = flat_idx.masked_select(valid_mask.reshape(-1)) + chunk_masked_target.masked_select(valid_mask)
+
+            grad_logits = -softmax_output if ctx.entropy_requires_grad else softmax_output.neg_()
+            grad_logits.mul_(chunk_grad_output.unsqueeze(-1))
+            grad_output_selected = chunk_grad_output.masked_select(valid_mask)
+            grad_logits.view(-1).scatter_add_(0, flat_chosen, grad_output_selected)
+            if ctx.entropy_requires_grad and grad_entropy is not None:
+                chunk_grad_entropy = grad_entropy[:, chunk_start:chunk_end]
+                grad_logits.add_(
+                    -softmax_output
+                    * (distributed_log_probs + chunk_entropy.unsqueeze(-1))
+                    * chunk_grad_entropy.unsqueeze(-1)
+                )
+            if tanh is not None:
+                # Chain through the softcap and temperature: d/dz = (1 - tanh²) / T.
+                grad_logits.mul_(tanh.square_().neg_().add_(1.0).div_(ctx.temperature))
+
+            grad_logits = grad_logits.to(dtype=weight.dtype)  # [B, cs, V//TP]
+
+            # Project chunk logit-grad back to hidden / weight grads.
+            grad_hidden[:, chunk_start:chunk_end, :] = torch.matmul(grad_logits, weight)
+            if compute_weight_grad:
+                grad_logits_2d = grad_logits.reshape(-1, partition_vocab_size)
+                h_2d = h_chunk.reshape(-1, hidden_size)
+                # Run the [V//TP, H] weight-grad matmul in the low-precision compute
+                # dtype (grad_logits.dtype == weight.dtype) so it hits Tensor Cores,
+                # then cast up to fp32 for the accumulator. This matches what
+                # ColumnParallelLinear's own backward does and is much faster / uses
+                # less memory than an fp32 matmul, while the cross-chunk accumulation
+                # still happens in fp32.
+                grad_weight.add_(torch.matmul(grad_logits_2d.t(), h_2d.to(dtype=grad_logits.dtype)).to(torch.float32))
+
+        grad_weight_out = grad_weight.to(weight.dtype) if compute_weight_grad else None
+        grads = (grad_hidden, grad_weight_out, None, None, None, None, None, None, None, None, None, None)
+        return grads[: len(ctx.needs_input_grad)]
+
+
+def _fused_lm_head_logprob_apply(
+    backend: str,
+    hidden: torch.Tensor,
+    weight: torch.Tensor,
+    target: torch.Tensor,
+    vocab_start_index: int,
+    vocab_end_index: int,
+    chunk_size: int,
+    tp_group: torch.distributed.ProcessGroup,
+    inference_only: bool,
+    active_mask: Optional[torch.Tensor] = None,
+    compute_entropy: bool = False,
+    entropy_requires_grad: bool = False,
+    softcap: Optional[float] = None,
+    temperature: float = 1.0,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Dispatch the fused LM-head token-logprob to the requested backend.
+
+    ``"torch"`` uses :class:`FusedLinearChunkedDistributedLogprob`; both Triton
+    backends use ``FusedLinearLogprobTriton`` when CUDA + triton are available
+    and otherwise warn and fall back to torch. Both return TP-combined ``[B, S]``
+    log-probs and, when requested, entropy. Only the torch backend applies a final
+    logit ``softcap`` (and then ``temperature``); with a softcap, both Triton
+    backends fall back to it.
+    """
+    if entropy_requires_grad and not compute_entropy:
+        raise ValueError("entropy_requires_grad=True requires compute_entropy=True")
+    triton_backends = (FusedLmHeadBackend.TRITON, FusedLmHeadBackend.TRITON_BLOCK_SPARSE)
+    if backend in triton_backends and softcap is not None:
+        warnings.warn(
+            f"fused_lm_head_logprob_backend={backend!r} has no final logit softcap; using the PyTorch backend.",
+            stacklevel=2,
+        )
+        backend = FusedLmHeadBackend.TORCH
+    if backend in triton_backends:
+        try:
+            from skyrl.backends.skyrl_train.distributed.megatron.fused_linear_logprob_triton import (
+                TRITON_AVAILABLE,
+                FusedLinearLogprobTriton,
+                is_cuda_available,
+            )
+
+            if not (TRITON_AVAILABLE and is_cuda_available):
+                raise ImportError("triton is not installed or no CUDA device is available")
+            return FusedLinearLogprobTriton.apply(  # type: ignore[no-any-return]
+                hidden,
+                weight,
+                target,
+                vocab_start_index,
+                vocab_end_index,
+                chunk_size,
+                tp_group,
+                inference_only,
+                active_mask,
+                compute_entropy,
+                entropy_requires_grad,
+            )
+        except (ImportError, RuntimeError) as e:
+            warnings.warn(
+                f"fused_lm_head_logprob_backend={backend!r} unavailable ({e}); falling back to the "
+                "pure-PyTorch backend. Use a CUDA environment with Triton available to run the fused Triton kernel.",
+                stacklevel=2,
+            )
+
+    result = FusedLinearChunkedDistributedLogprob.apply(
+        hidden,
+        weight,
+        target,
+        vocab_start_index,
+        vocab_end_index,
+        chunk_size,
+        tp_group,
+        inference_only,
+        compute_entropy,
+        entropy_requires_grad,
+        softcap,
+        temperature,
+    )
+    if compute_entropy:
+        logprobs, entropy = result
+    else:
+        logprobs = result
+    if active_mask is not None:
+        active_mask = active_mask.to(device=logprobs.device, dtype=torch.bool)
+        logprobs = logprobs.masked_fill(~active_mask, 0.0)
+    if not compute_entropy:
+        return logprobs  # type: ignore[no-any-return]
+    if active_mask is not None:
+        entropy = entropy.masked_fill(~active_mask, 0.0)
+    return logprobs, entropy
 
 
 def from_parallel_logits_to_logprobs(
@@ -355,6 +687,8 @@ def from_parallel_logits_to_logprobs_packed_sequences(
     inference_only: bool = False,
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
     chunk_size: Optional[int] = None,
+    attention_mask: Optional[torch.Tensor] = None,
+    sub_seq_lengths: Optional[list[list[int]]] = None,
 ) -> torch.Tensor:
     """Get log probabilities from TP sharded vocab logits for packed sequences.
 
@@ -372,31 +706,42 @@ def from_parallel_logits_to_logprobs_packed_sequences(
         inference_only (bool, optional): If True, tensors won't be saved for backward pass. Defaults to False.
         cp_group (torch.distributed.ProcessGroup, optional): Context parallelism process group. Defaults to None.
         chunk_size (int, optional): Sequence dimension chunk size for computing the log probabilities.
+        attention_mask (torch.Tensor, optional): Original unpacked attention mask with shape [batch_size, unpacked_seqlen].
+            When provided, packed log probabilities are scattered back to their original padded sequence positions.
+        sub_seq_lengths (list[list[int]], optional): Per-row sub-sequence lengths for controller-side sequence packing.
+            When provided, ``cu_seqlens_padded`` is interpreted as one entry per sub-sequence, and output values are
+            scattered back to the row offsets used by ``PackedDataCollator``.
 
     Returns:
         torch.Tensor: Unpacked log probabilities tensor with shape [batch_size, unpacked_seqlen-1].
             The total length is reduced by batch_size due to target shifting (one token per sequence).
     """
+    # This packed logprob path has been verified by Megatron GSM8K E2E runs covering no-CP, CP ring, and CP a2a.
     # Remove batch dimension to work with [T, vocab_size] and [T]
     vocab_parallel_logits = vocab_parallel_logits.squeeze(0)
     target = target.squeeze(0)
 
-    batch_size = cu_seqlens_padded.shape[0] - 1
+    batch_size = len(sub_seq_lengths) if sub_seq_lengths is not None else cu_seqlens_padded.shape[0] - 1
     cp_size = 1 if cp_group is None else torch.distributed.get_world_size(cp_group)
     cp_rank = 0 if cp_group is None else torch.distributed.get_rank(cp_group)
+    if attention_mask is not None:
+        attention_mask = attention_mask.to(device=target.device, dtype=torch.bool)
 
-    # Roll each sequence individually
-    rolled_targets = torch.zeros(target.shape[0] // cp_size, dtype=target.dtype, device=target.device)
-    for i in range(batch_size):
-        start_idx = cu_seqlens_padded[i].item()
-        end_idx = cu_seqlens_padded[i + 1].item()
+    cu_seqlens_padded, _, seq_indices, seq_offsets, seq_lens_padded = _packed_sequence_indices(
+        cu_seqlens_padded, target.shape[0], target.device
+    )
 
-        # Get the sequence targets and roll by -1
-        seq_targets = target[start_idx:end_idx]
-        rolled_seq_targets = seq_targets.roll(shifts=-1, dims=0)
-        rolled_targets[start_idx // cp_size : end_idx // cp_size] = _get_tokens_on_this_cp_rank(
-            rolled_seq_targets, cp_rank, cp_size, seq_dim=0
+    next_offsets = torch.remainder(seq_offsets + 1, seq_lens_padded[seq_indices])
+    rolled_targets_full = target[cu_seqlens_padded[seq_indices] + next_offsets]
+    if cp_size > 1:
+        cp_rank_for_token, local_indices = _packed_cp_rank_and_local_indices(
+            cu_seqlens_padded, seq_indices, seq_offsets, seq_lens_padded, cp_size
         )
+        rolled_targets = torch.empty(target.shape[0] // cp_size, dtype=target.dtype, device=target.device)
+        current_rank_mask = cp_rank_for_token == cp_rank
+        rolled_targets[local_indices[current_rank_mask]] = rolled_targets_full[current_rank_mask]
+    else:
+        rolled_targets = rolled_targets_full
 
     # Add batch dimension back for DistributedLogprob
     rolled_targets = rolled_targets.unsqueeze(0)
@@ -441,35 +786,390 @@ def from_parallel_logits_to_logprobs_packed_sequences(
         )
 
     if cp_size > 1:
-        # per-sequence cp_allgather
-        final_probs = torch.zeros(probs.shape[0] * cp_size, device=probs.device)
-        for i in range(batch_size):
-            start_idx = cu_seqlens_padded[i].item()
-            end_idx = cu_seqlens_padded[i + 1].item()
-            final_probs[start_idx:end_idx] = allgather_cp_sharded_tensor(
-                probs[start_idx // cp_size : end_idx // cp_size], cp_group, seq_dim=0
-            )
-        probs = final_probs
+        probs = allgather_cp_sharded_packed_tensor(probs, cu_seqlens_padded, cp_group)
 
     out_logprobs = torch.zeros((batch_size, unpacked_seqlen - 1), dtype=probs.dtype, device=probs.device)
-    # Filter out the last token of each sequence
-    for i in range(batch_size):
-        start_idx = cu_seqlens_padded[i].item()
-        end_idx = cu_seqlens_padded[i + 1].item()
+    _, _, seq_indices, seq_offsets, seq_lens_padded = _packed_sequence_indices(
+        cu_seqlens_padded, probs.shape[0], probs.device
+    )
 
-        # Exclude the last position (which has the rolled target from position 0)
-        if end_idx - start_idx > 0:
-            seq_probs = probs[start_idx : end_idx - 1]
-            # Ensure seq_probs is 1D
-            if seq_probs.dim() > 1:
-                seq_probs = seq_probs.squeeze()
+    if sub_seq_lengths is not None:
+        row_indices, row_offsets, seq_lens = _packed_subseq_row_indices_offsets_and_lens(
+            cu_seqlens_padded, sub_seq_lengths, probs.device
+        )
+        valid_counts = torch.clamp(seq_lens - 1, min=0)
+        packed_mask = seq_offsets < valid_counts[seq_indices]
+        output_cols = row_offsets[seq_indices[packed_mask]] + seq_offsets[packed_mask]
+        output_rows = row_indices[seq_indices[packed_mask]]
+        output_in_bounds = output_cols < unpacked_seqlen - 1
+        out_logprobs[output_rows[output_in_bounds], output_cols[output_in_bounds]] = probs[packed_mask][
+            output_in_bounds
+        ]
+        return out_logprobs
 
-            # Ensure we don't exceed the unpacked sequence length
-            seq_len = min(seq_probs.shape[0], unpacked_seqlen - 1)
-            if seq_len > 0:
-                out_logprobs[i, :seq_len] = seq_probs[:seq_len]
+    if attention_mask is not None:
+        seq_lens = attention_mask.sum(dim=1, dtype=torch.long)
+        token_ordinals = attention_mask.to(torch.long).cumsum(dim=1)
+        output_mask = attention_mask[:, :-1] & (token_ordinals[:, :-1] < seq_lens.unsqueeze(1))
+        valid_counts = torch.clamp(seq_lens - 1, min=0)
+        packed_mask = seq_offsets < valid_counts[seq_indices]
+        out_logprobs[output_mask] = probs[packed_mask]
+        return out_logprobs
+
+    valid_counts = torch.clamp(seq_lens_padded - 1, min=0)
+    packed_mask = (seq_offsets < valid_counts[seq_indices]) & (seq_offsets < unpacked_seqlen - 1)
+    out_logprobs[seq_indices[packed_mask], seq_offsets[packed_mask]] = probs[packed_mask]
 
     return out_logprobs
+
+
+def from_parallel_hidden_to_logprobs(
+    hidden: torch.Tensor,
+    lm_head_weight: torch.Tensor,
+    target: torch.Tensor,
+    vocab_start_index: int,
+    vocab_end_index: int,
+    tp_group: torch.distributed.ProcessGroup,
+    inference_only: bool = False,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    chunk_size: Optional[int] = None,
+    temperature: float = 1.0,
+    fused_backend: str = "torch",
+    active_mask: Optional[torch.Tensor] = None,
+    return_entropy: bool = False,
+    entropy_requires_grad: bool = False,
+    softcap: Optional[float] = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Fused-LM-head variant of :func:`from_parallel_logits_to_logprobs`.
+
+    Takes the decoder ``hidden`` states [B, S//CP, H] and the output-layer
+    ``lm_head_weight`` [V//TP, H] instead of pre-computed vocab-parallel logits,
+    and folds the output projection into the chunked logprob op so the full
+    logits tensor is never materialized. Numerically identical to
+    ``from_parallel_logits_to_logprobs((hidden @ lm_head_weightᵀ) / temperature, ...)``.
+
+    ``temperature`` scaling is applied by dividing the weight (``hidden @
+    (W/T)ᵀ == logits/T``); autograd then chains the ``1/T`` factor onto both
+    ``grad_hidden`` and ``grad_weight`` exactly, so the op itself stays
+    temperature-agnostic. With a final logit ``softcap`` (the output layer's
+    ``softcap * tanh(logits / softcap)``) the temperature has to follow the cap,
+    so the op applies both itself. ``return_entropy`` reuses the same projection; set
+    ``entropy_requires_grad`` when entropy contributes to the RL loss.
+    """
+    if entropy_requires_grad and not return_entropy:
+        raise ValueError("entropy_requires_grad=True requires return_entropy=True")
+    if temperature != 1.0 and softcap is None:
+        lm_head_weight = lm_head_weight / temperature
+    if active_mask is not None:
+        expected_shape = (target.shape[0], target.shape[1] - 1)
+        if active_mask.shape != expected_shape:
+            raise ValueError(f"Expected active_mask shape {expected_shape}, got {tuple(active_mask.shape)}")
+        active_mask = torch.nn.functional.pad(active_mask.to(device=target.device, dtype=torch.bool), (0, 1))
+
+    target = target.roll(shifts=-1, dims=-1)
+    cp_size = 1 if cp_group is None else torch.distributed.get_world_size(cp_group)
+    pad_len = hidden.shape[1] * cp_size - target.shape[1]
+    if pad_len > 0:
+        target = torch.nn.functional.pad(target, (0, pad_len), value=0)
+
+    cp_rank = torch.distributed.get_rank(cp_group)
+    target = _get_tokens_on_this_cp_rank(target, cp_rank, cp_size, seq_dim=1)
+    if active_mask is not None:
+        if pad_len > 0:
+            active_mask = torch.nn.functional.pad(active_mask, (0, pad_len), value=False)
+        active_mask = _get_tokens_on_this_cp_rank(active_mask, cp_rank, cp_size, seq_dim=1)
+
+    seq_len_local = hidden.shape[1]
+    eff_chunk = chunk_size if (chunk_size is not None and chunk_size < seq_len_local) else seq_len_local
+    result = _fused_lm_head_logprob_apply(
+        fused_backend,
+        hidden,
+        lm_head_weight,
+        target,
+        vocab_start_index,
+        vocab_end_index,
+        eff_chunk,
+        tp_group,
+        inference_only,
+        active_mask,
+        return_entropy,
+        entropy_requires_grad,
+        softcap=softcap,
+        temperature=temperature,
+    )
+    if return_entropy:
+        logprobs, entropy = result
+        entropy = entropy.contiguous()
+    else:
+        logprobs = result
+    logprobs = logprobs.contiguous()
+
+    if cp_size > 1:
+        logprobs = allgather_cp_sharded_tensor(logprobs, cp_group, seq_dim=1)
+        if return_entropy:
+            entropy = allgather_cp_sharded_tensor(entropy, cp_group, seq_dim=1)
+
+    if pad_len > 0:
+        logprobs = logprobs[:, :-pad_len]
+        if return_entropy:
+            entropy = entropy[:, :-pad_len]
+
+    logprobs = logprobs[:, :-1]
+    if return_entropy:
+        return logprobs, entropy[:, :-1]
+    return logprobs
+
+
+def _unpack_prediction_values(
+    values: torch.Tensor,
+    cu_seqlens_padded: torch.Tensor,
+    unpacked_seqlen: int,
+    seq_indices: torch.Tensor,
+    seq_offsets: torch.Tensor,
+    seq_lens_padded: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    sub_seq_lengths: Optional[list[list[int]]],
+) -> torch.Tensor:
+    """Scatter packed prediction values into the original batch layout."""
+    batch_size = len(sub_seq_lengths) if sub_seq_lengths is not None else cu_seqlens_padded.shape[0] - 1
+    output = torch.zeros((batch_size, unpacked_seqlen - 1), dtype=values.dtype, device=values.device)
+    if sub_seq_lengths is not None:
+        row_indices, row_offsets, seq_lens = _packed_subseq_row_indices_offsets_and_lens(
+            cu_seqlens_padded, sub_seq_lengths, values.device
+        )
+        valid_counts = torch.clamp(seq_lens - 1, min=0)
+        packed_mask = seq_offsets < valid_counts[seq_indices]
+        output_cols = row_offsets[seq_indices[packed_mask]] + seq_offsets[packed_mask]
+        output_rows = row_indices[seq_indices[packed_mask]]
+        output_in_bounds = output_cols < unpacked_seqlen - 1
+        output[output_rows[output_in_bounds], output_cols[output_in_bounds]] = values[packed_mask][output_in_bounds]
+        return output
+
+    if attention_mask is not None:
+        seq_lens = attention_mask.sum(dim=1, dtype=torch.long)
+        token_ordinals = attention_mask.to(torch.long).cumsum(dim=1)
+        output_mask = attention_mask[:, :-1] & (token_ordinals[:, :-1] < seq_lens.unsqueeze(1))
+        valid_counts = torch.clamp(seq_lens - 1, min=0)
+        packed_mask = seq_offsets < valid_counts[seq_indices]
+        output[output_mask] = values[packed_mask]
+        return output
+
+    valid_counts = torch.clamp(seq_lens_padded - 1, min=0)
+    packed_mask = (seq_offsets < valid_counts[seq_indices]) & (seq_offsets < unpacked_seqlen - 1)
+    output[seq_indices[packed_mask], seq_offsets[packed_mask]] = values[packed_mask]
+    return output
+
+
+def from_parallel_hidden_to_logprobs_packed_sequences(
+    hidden: torch.Tensor,
+    lm_head_weight: torch.Tensor,
+    target: torch.Tensor,
+    cu_seqlens_padded: torch.Tensor,
+    unpacked_seqlen: int,
+    vocab_start_index: int,
+    vocab_end_index: int,
+    group: torch.distributed.ProcessGroup,
+    inference_only: bool = False,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    chunk_size: Optional[int] = None,
+    attention_mask: Optional[torch.Tensor] = None,
+    sub_seq_lengths: Optional[list[list[int]]] = None,
+    temperature: float = 1.0,
+    fused_backend: str = "torch",
+    active_mask: Optional[torch.Tensor] = None,
+    return_entropy: bool = False,
+    entropy_requires_grad: bool = False,
+    softcap: Optional[float] = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Fused-LM-head variant of
+    :func:`from_parallel_logits_to_logprobs_packed_sequences`.
+
+    Identical packed-sequence / CP / scatter-back logic, but the output
+    projection is fused into the chunked logprob op (``hidden`` [1, T//CP, H] +
+    ``lm_head_weight`` [V//TP, H] instead of logits [1, T//CP, V//TP]).
+    ``temperature`` and ``softcap`` are applied as in
+    ``from_parallel_hidden_to_logprobs``. Optional entropy uses the same packed
+    CP gather and scatter-back layout as log-probs.
+    """
+    if entropy_requires_grad and not return_entropy:
+        raise ValueError("entropy_requires_grad=True requires return_entropy=True")
+    if temperature != 1.0 and softcap is None:
+        lm_head_weight = lm_head_weight / temperature
+    if active_mask is not None:
+        if active_mask.shape != target.shape:
+            raise ValueError(f"Expected packed active_mask shape {tuple(target.shape)}, got {tuple(active_mask.shape)}")
+        active_mask = active_mask.to(device=target.device, dtype=torch.bool).squeeze(0)
+    hidden = hidden.squeeze(0)
+    target = target.squeeze(0)
+
+    cp_size = 1 if cp_group is None else torch.distributed.get_world_size(cp_group)
+    cp_rank = 0 if cp_group is None else torch.distributed.get_rank(cp_group)
+    if attention_mask is not None:
+        attention_mask = attention_mask.to(device=target.device, dtype=torch.bool)
+
+    cu_seqlens_padded, _, seq_indices, seq_offsets, seq_lens_padded = _packed_sequence_indices(
+        cu_seqlens_padded, target.shape[0], target.device
+    )
+
+    next_offsets = torch.remainder(seq_offsets + 1, seq_lens_padded[seq_indices])
+    rolled_targets_full = target[cu_seqlens_padded[seq_indices] + next_offsets]
+    if cp_size > 1:
+        cp_rank_for_token, local_indices = _packed_cp_rank_and_local_indices(
+            cu_seqlens_padded, seq_indices, seq_offsets, seq_lens_padded, cp_size
+        )
+        rolled_targets = torch.empty(target.shape[0] // cp_size, dtype=target.dtype, device=target.device)
+        current_rank_mask = cp_rank_for_token == cp_rank
+        rolled_targets[local_indices[current_rank_mask]] = rolled_targets_full[current_rank_mask]
+    else:
+        rolled_targets = rolled_targets_full
+
+    if active_mask is not None:
+        if cp_size > 1:
+            local_active_mask = torch.zeros_like(rolled_targets, dtype=torch.bool)
+            local_active_mask[local_indices[current_rank_mask]] = active_mask[current_rank_mask]
+            active_mask = local_active_mask
+        active_mask = active_mask.unsqueeze(0)
+
+    # Add batch dimension back for the fused logprob op after CP-local scatters,
+    # whose indices address the one-dimensional packed token layout.
+    rolled_targets = rolled_targets.unsqueeze(0)
+    hidden = hidden.unsqueeze(0)
+
+    seq_len_local = hidden.shape[1]
+    eff_chunk = chunk_size if (chunk_size is not None and chunk_size < seq_len_local) else seq_len_local
+    result = _fused_lm_head_logprob_apply(
+        fused_backend,
+        hidden,
+        lm_head_weight,
+        rolled_targets,
+        vocab_start_index,
+        vocab_end_index,
+        eff_chunk,
+        group,
+        inference_only,
+        active_mask,
+        return_entropy,
+        entropy_requires_grad,
+        softcap=softcap,
+        temperature=temperature,
+    )
+    if return_entropy:
+        probs, entropy_probs = result
+        entropy_probs = entropy_probs.contiguous()
+    else:
+        probs = result
+    probs = probs.contiguous()
+
+    probs = probs.squeeze(0)
+    if probs.dim() != 1:
+        raise ValueError(f"Expected probs to be 1D after squeezing, but got shape {probs.shape}.")
+    if return_entropy:
+        entropy_probs = entropy_probs.squeeze(0)
+        if entropy_probs.dim() != 1:
+            raise ValueError(f"Expected entropy to be 1D after squeezing, but got shape {entropy_probs.shape}.")
+
+    if cp_size > 1:
+        probs = allgather_cp_sharded_packed_tensor(probs, cu_seqlens_padded, cp_group)
+        if return_entropy:
+            entropy_probs = allgather_cp_sharded_packed_tensor(entropy_probs, cu_seqlens_padded, cp_group)
+
+    _, _, seq_indices, seq_offsets, seq_lens_padded = _packed_sequence_indices(
+        cu_seqlens_padded, probs.shape[0], probs.device
+    )
+
+    logprobs = _unpack_prediction_values(
+        probs,
+        cu_seqlens_padded,
+        unpacked_seqlen,
+        seq_indices,
+        seq_offsets,
+        seq_lens_padded,
+        attention_mask,
+        sub_seq_lengths,
+    )
+    if return_entropy:
+        entropy = _unpack_prediction_values(
+            entropy_probs,
+            cu_seqlens_padded,
+            unpacked_seqlen,
+            seq_indices,
+            seq_offsets,
+            seq_lens_padded,
+            attention_mask,
+            sub_seq_lengths,
+        )
+        return logprobs, entropy
+    return logprobs
+
+
+def _packed_subseq_row_indices_offsets_and_lens(
+    cu_seqlens_padded: torch.Tensor, sub_seq_lengths: list[list[int]], device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return per-packed-segment row metadata for controller-side sequence packing."""
+    cu_seqlens_cpu = cu_seqlens_padded.detach().cpu().tolist()
+    padded_lens = [cu_seqlens_cpu[i + 1] - cu_seqlens_cpu[i] for i in range(len(cu_seqlens_cpu) - 1)]
+
+    row_indices: list[int] = []
+    row_offsets: list[int] = []
+    seq_lens: list[int] = []
+    seg_idx = 0
+    for row_idx, row_lens in enumerate(sub_seq_lengths):
+        row_offset = 0
+        for seq_len in row_lens:
+            if seg_idx >= len(padded_lens):
+                raise ValueError("sub_seq_lengths contains more sub-sequences than cu_seqlens_padded")
+            row_indices.append(row_idx)
+            row_offsets.append(row_offset)
+            seq_lens.append(int(seq_len))
+            row_offset += padded_lens[seg_idx]
+            seg_idx += 1
+
+    if seg_idx != len(padded_lens):
+        raise ValueError(
+            f"sub_seq_lengths describes {seg_idx} sub-sequences, but cu_seqlens_padded describes {len(padded_lens)}"
+        )
+
+    return (
+        torch.tensor(row_indices, dtype=torch.long, device=device),
+        torch.tensor(row_offsets, dtype=torch.long, device=device),
+        torch.tensor(seq_lens, dtype=torch.long, device=device),
+    )
+
+
+def _packed_sequence_indices(
+    cu_seqlens_padded: torch.Tensor, total_tokens: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    cu_seqlens_padded = cu_seqlens_padded.to(device=device, dtype=torch.long)
+    token_indices = torch.arange(total_tokens, device=device)
+    seq_indices = torch.searchsorted(cu_seqlens_padded[1:], token_indices, right=True)
+    seq_offsets = token_indices - cu_seqlens_padded[seq_indices]
+    seq_lens_padded = lengths_from_offsets(cu_seqlens_padded)
+    return cu_seqlens_padded, token_indices, seq_indices, seq_offsets, seq_lens_padded
+
+
+def _packed_cp_rank_and_local_indices(
+    cu_seqlens_padded: torch.Tensor,
+    seq_indices: torch.Tensor,
+    seq_offsets: torch.Tensor,
+    seq_lens_padded: torch.Tensor,
+    cp_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if cp_size == 1:
+        return torch.zeros_like(seq_indices), cu_seqlens_padded[seq_indices] + seq_offsets
+
+    seq_lens_for_token = seq_lens_padded[seq_indices]
+    chunk_size = torch.div(seq_lens_for_token, 2 * cp_size, rounding_mode="floor")
+    chunk_indices = torch.div(seq_offsets, chunk_size, rounding_mode="floor")
+    rank_for_token = torch.where(chunk_indices < cp_size, chunk_indices, 2 * cp_size - chunk_indices - 1)
+    within_chunk_offsets = seq_offsets - chunk_indices * chunk_size
+    within_rank_offsets = torch.where(
+        chunk_indices < cp_size,
+        within_chunk_offsets,
+        chunk_size + within_chunk_offsets,
+    )
+    local_starts = torch.div(cu_seqlens_padded[:-1], cp_size, rounding_mode="floor")
+    local_indices = local_starts[seq_indices] + within_rank_offsets
+    return rank_for_token, local_indices
 
 
 def _get_tokens_on_this_cp_rank(
@@ -511,6 +1211,141 @@ def _get_tokens_on_this_cp_rank(
 
 def allgather_cp_sharded_tensor(tensor, cp_group, seq_dim=1):  # , unpadded_seqlen=None):
     return AllGatherCPTensor.apply(tensor, cp_group, seq_dim)  # , unpadded_seqlen)
+
+
+def allgather_cp_sharded_packed_tensor(tensor, cu_seqlens_padded, cp_group):
+    return AllGatherPackedCPTensor.apply(tensor, cu_seqlens_padded, cp_group)
+
+
+def vocab_parallel_entropy_packed_sequences(
+    vocab_parallel_logits: torch.Tensor,
+    cu_seqlens_padded: torch.Tensor,
+    unpacked_seqlen: int,
+    num_actions: int,
+    attention_mask: torch.Tensor,
+    loss_mask: Optional[torch.Tensor],
+    cp_group: Optional[torch.distributed.ProcessGroup],
+    sub_seq_lengths: Optional[list[list[int]]] = None,
+    chunk_size: Optional[int] = None,
+    chunk_memory_mb: int = 512,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute action-token entropy directly on TP+CP sharded packed logits.
+
+    Returns:
+        A tuple of (global entropy metric, local entropy term for loss). The
+        local term is normalized by the global action-token count. Megatron's
+        schedule already applies the CP loss scale for two-output loss funcs.
+    """
+    device = vocab_parallel_logits.device
+    dtype = vocab_parallel_logits.dtype
+
+    attention_mask = attention_mask.to(device=device, dtype=torch.bool)
+    cu_seqlens_padded = cu_seqlens_padded.to(device=device, dtype=torch.long)
+    batch_size = attention_mask.shape[0]
+
+    action_weights = torch.zeros((batch_size, unpacked_seqlen - 1), dtype=dtype, device=device)
+    if loss_mask is None:
+        action_weights[:, -num_actions:] = 1.0
+    else:
+        action_weights[:, -num_actions:] = loss_mask.to(device=device, dtype=dtype)
+
+    packed_weights = torch.zeros((int(cu_seqlens_padded[-1].item()),), dtype=dtype, device=device)
+    if sub_seq_lengths is not None:
+        _, _, seq_indices, seq_offsets, _ = _packed_sequence_indices(cu_seqlens_padded, packed_weights.shape[0], device)
+        row_indices, row_offsets, seq_lens = _packed_subseq_row_indices_offsets_and_lens(
+            cu_seqlens_padded, sub_seq_lengths, device
+        )
+        valid_counts = torch.clamp(seq_lens - 1, min=0)
+        packed_mask = seq_offsets < valid_counts[seq_indices]
+        output_cols = row_offsets[seq_indices[packed_mask]] + seq_offsets[packed_mask]
+        output_rows = row_indices[seq_indices[packed_mask]]
+        output_in_bounds = output_cols < action_weights.shape[1]
+        packed_weights[torch.arange(packed_weights.shape[0], device=device)[packed_mask][output_in_bounds]] = (
+            action_weights[output_rows[output_in_bounds], output_cols[output_in_bounds]]
+        )
+    else:
+        seq_lens = attention_mask.sum(dim=1, dtype=torch.long)
+        token_ordinals = attention_mask.to(torch.long).cumsum(dim=1)
+        output_mask = attention_mask[:, :-1] & (token_ordinals[:, :-1] < seq_lens.unsqueeze(1))
+
+        token_offsets = token_ordinals - 1
+        packed_indices = cu_seqlens_padded[:-1].unsqueeze(1) + token_offsets
+        packed_weights[packed_indices[:, :-1][output_mask]] = action_weights[output_mask]
+
+    cp_size = 1 if cp_group is None else torch.distributed.get_world_size(cp_group)
+    if cp_size > 1:
+        cp_rank = torch.distributed.get_rank(cp_group)
+        _, _, seq_indices, seq_offsets, seq_lens_padded = _packed_sequence_indices(
+            cu_seqlens_padded, packed_weights.shape[0], device
+        )
+        cp_rank_for_token, local_indices = _packed_cp_rank_and_local_indices(
+            cu_seqlens_padded, seq_indices, seq_offsets, seq_lens_padded, cp_size
+        )
+        local_weights = torch.zeros((int(vocab_parallel_logits.shape[-2]),), dtype=dtype, device=device)
+        current_rank_mask = cp_rank_for_token == cp_rank
+        local_weights[local_indices[current_rank_mask]] = packed_weights[current_rank_mask]
+    else:
+        local_weights = packed_weights
+
+    local_entropy_sum = vocab_parallel_entropy_weighted_sum(
+        vocab_parallel_logits,
+        local_weights,
+        chunk_size=chunk_size,
+        chunk_memory_mb=chunk_memory_mb,
+    )
+    local_count = local_weights.sum()
+    global_count = local_count.detach().clone()
+    global_entropy_sum = local_entropy_sum.detach().clone()
+    if cp_size > 1:
+        torch.distributed.all_reduce(global_count, group=cp_group)
+        torch.distributed.all_reduce(global_entropy_sum, group=cp_group)
+    global_count = global_count.clamp(min=1.0)
+
+    entropy = global_entropy_sum / global_count
+    entropy_for_loss = local_entropy_sum / global_count
+    return entropy, entropy_for_loss
+
+
+class AllGatherPackedCPTensor(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, tensor: torch.Tensor, cu_seqlens_padded: torch.Tensor, cp_group: torch.distributed.ProcessGroup):
+        cp_size = torch.distributed.get_world_size(cp_group)
+        cp_rank_chunks = [torch.empty_like(tensor) for _ in range(cp_size)]
+        torch.distributed.all_gather(tensor_list=cp_rank_chunks, tensor=tensor, group=cp_group)
+
+        total_tokens = tensor.shape[0] * cp_size
+        cu_seqlens_padded, _, seq_indices, seq_offsets, seq_lens_padded = _packed_sequence_indices(
+            cu_seqlens_padded, total_tokens, tensor.device
+        )
+        cp_rank_for_token, local_indices = _packed_cp_rank_and_local_indices(
+            cu_seqlens_padded, seq_indices, seq_offsets, seq_lens_padded, cp_size
+        )
+
+        gathered = torch.stack(cp_rank_chunks, dim=0)
+        output = gathered[cp_rank_for_token, local_indices]
+
+        ctx.cp_group = cp_group
+        ctx.save_for_backward(cu_seqlens_padded)
+        ctx.local_tokens = tensor.shape[0]
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        cp_size = torch.distributed.get_world_size(ctx.cp_group)
+        cp_rank = torch.distributed.get_rank(ctx.cp_group)
+        (cu_seqlens_padded,) = ctx.saved_tensors
+
+        cu_seqlens_padded, _, seq_indices, seq_offsets, seq_lens_padded = _packed_sequence_indices(
+            cu_seqlens_padded, grad_output.shape[0], grad_output.device
+        )
+        cp_rank_for_token, local_indices = _packed_cp_rank_and_local_indices(
+            cu_seqlens_padded, seq_indices, seq_offsets, seq_lens_padded, cp_size
+        )
+
+        local_rank_mask = cp_rank_for_token == cp_rank
+        grad_input = torch.zeros(ctx.local_tokens, dtype=grad_output.dtype, device=grad_output.device)
+        grad_input[local_indices[local_rank_mask]] = grad_output[local_rank_mask]
+        return grad_input, None, None
 
 
 class AllGatherCPTensor(torch.autograd.Function):
@@ -608,7 +1443,51 @@ class _VocabParallelEntropy(torch.autograd.Function):
         return softmax_logits
 
 
-def vocab_parallel_entropy(vocab_parallel_logits: torch.Tensor) -> torch.Tensor:
+def _floor_power_of_two(value: int) -> int:
+    return 1 << (value.bit_length() - 1)
+
+
+def _resolve_vocab_entropy_chunk_size(
+    vocab_parallel_logits: torch.Tensor,
+    chunk_size: Optional[int],
+    chunk_memory_mb: int,
+    peak_factor: int = 4,
+) -> Optional[int]:
+    """Resolve the sequence chunk size for vocab entropy.
+
+    ``None`` disables chunking. ``0`` uses the runtime vocab shard and dtype to
+    choose a size. Positive values specify the number of tokens per chunk.
+    """
+    if chunk_size is None:
+        return None
+    if chunk_size < 0:
+        raise ValueError(f"chunk_size must be non-negative or None, got {chunk_size}")
+    if chunk_memory_mb <= 0:
+        raise ValueError(f"chunk_memory_mb must be positive, got {chunk_memory_mb}")
+    seq_len = int(vocab_parallel_logits.shape[-2])
+    if seq_len <= 0:
+        return None
+    if chunk_size > 0:
+        return chunk_size if chunk_size < seq_len else None
+
+    budget_bytes = int(chunk_memory_mb) * 1024 * 1024
+    leading_elements = prod(vocab_parallel_logits.shape[:-2])
+    bytes_per_token = (
+        leading_elements * int(vocab_parallel_logits.shape[-1]) * vocab_parallel_logits.element_size() * peak_factor
+    )
+    if bytes_per_token <= 0:
+        return None
+
+    auto_chunk = max(1, min(seq_len, budget_bytes // bytes_per_token))
+    auto_chunk = _floor_power_of_two(auto_chunk)
+    return auto_chunk if auto_chunk < seq_len else None
+
+
+def vocab_parallel_entropy(
+    vocab_parallel_logits: torch.Tensor,
+    chunk_size: Optional[int] = None,
+    chunk_memory_mb: int = 512,
+) -> torch.Tensor:
     """Compute entropy when the logits are sharded in tp ranks
 
     Args:
@@ -617,4 +1496,38 @@ def vocab_parallel_entropy(vocab_parallel_logits: torch.Tensor) -> torch.Tensor:
     Returns: (total_nnz,)
 
     """
-    return _VocabParallelEntropy.apply(vocab_parallel_logits)
+    resolved_chunk_size = _resolve_vocab_entropy_chunk_size(vocab_parallel_logits, chunk_size, chunk_memory_mb)
+    if resolved_chunk_size is None:
+        return _VocabParallelEntropy.apply(vocab_parallel_logits)
+
+    entropy_chunks = []
+    seq_len = int(vocab_parallel_logits.shape[-2])
+    for start in range(0, seq_len, resolved_chunk_size):
+        end = min(start + resolved_chunk_size, seq_len)
+        entropy_chunks.append(_VocabParallelEntropy.apply(vocab_parallel_logits[..., start:end, :]))
+    return torch.cat(entropy_chunks, dim=-1)
+
+
+def vocab_parallel_entropy_weighted_sum(
+    vocab_parallel_logits: torch.Tensor,
+    weights: torch.Tensor,
+    chunk_size: Optional[int] = None,
+    chunk_memory_mb: int = 512,
+) -> torch.Tensor:
+    """Compute ``sum(entropy * weights)`` with bounded temporary memory."""
+    resolved_chunk_size = _resolve_vocab_entropy_chunk_size(vocab_parallel_logits, chunk_size, chunk_memory_mb)
+    if resolved_chunk_size is None:
+        entropy_tokens = _VocabParallelEntropy.apply(vocab_parallel_logits)
+        return (entropy_tokens * weights).sum()
+
+    # Keep an autograd edge even when every chunk is masked out.
+    local_entropy_sum = vocab_parallel_logits[..., :0, :].sum()
+    seq_len = int(vocab_parallel_logits.shape[-2])
+    for start in range(0, seq_len, resolved_chunk_size):
+        end = min(start + resolved_chunk_size, seq_len)
+        weight_chunk = weights[start:end]
+        if torch.count_nonzero(weight_chunk).item() == 0:
+            continue
+        entropy_chunk = _VocabParallelEntropy.apply(vocab_parallel_logits[..., start:end, :])
+        local_entropy_sum = local_entropy_sum + (entropy_chunk * weight_chunk).sum()
+    return local_entropy_sum

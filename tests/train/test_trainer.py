@@ -16,6 +16,7 @@ from skyrl.backends.skyrl_train.workers.worker_utils import BatchIterator
 from skyrl.train.config import SkyRLTrainConfig
 from skyrl.train.trainer import RayPPOTrainer
 from skyrl.train.utils.utils import validate_batch_sizes
+from tests.backends.skyrl_train.sample_support_helpers import csr
 from tests.train.util import example_dummy_config
 
 
@@ -81,10 +82,10 @@ def _get_test_data(trainer: RayPPOTrainer):
     action_log_probs: Float[torch.Tensor, "batch_size total_seq_len"] = torch.log(
         torch.tensor([[0.1, 0.3, 0.2, 0.2, 0.2], [0.3, 0.3, 0.2, 0.1, 0.1]])
     )
-    action_masks: Integer[torch.Tensor, "batch_size total_seq_len"] = torch.stack(
+    response_masks: Integer[torch.Tensor, "batch_size total_seq_len"] = torch.stack(
         [torch.tensor([1, 1, 1, 0, 0], dtype=torch.int32), torch.tensor([1, 1, 1, 1, 1], dtype=torch.int32)], dim=0
     )
-    actual_response_lengths: Float[torch.Tensor, "batch_size"] = action_masks.sum(dim=-1).to(float)
+    actual_response_lengths: Float[torch.Tensor, "batch_size"] = response_masks.sum(dim=-1).to(float)
     rewards_all: Float[torch.Tensor, "batch_size total_seq_len"] = torch.stack(
         [torch.tensor([0.0, 1.0, 0.0, 0.0, 0.0]), torch.tensor([0.0, 0.0, 1.0, 0.0, 0.0])], dim=0
     )
@@ -99,7 +100,7 @@ def _get_test_data(trainer: RayPPOTrainer):
             "loss_mask": ret_loss_masks,
             "base_action_log_probs": base_log_probs,
             "action_log_probs": action_log_probs,
-            "response_mask": action_masks,
+            "response_mask": response_masks,
             "rewards": rewards_all,
             "values": values,
         },
@@ -112,6 +113,37 @@ def _get_test_data(trainer: RayPPOTrainer):
     data = trainer.apply_reward_kl_penalty(data)
 
     return data
+
+
+def test_convert_to_training_input_records_sample_support_metrics(dummy_config, dummy_tokenizer, dummy_generator):
+    dummy_config.trainer.policy_mini_batch_size = 2
+    trainer = RayPPOTrainer(
+        cfg=dummy_config,
+        tracker=None,
+        tokenizer=dummy_tokenizer,
+        train_dataset=DummyDataset(),
+        eval_dataset=None,
+        inference_engine_client=None,
+        generator=dummy_generator,
+    )
+    trainer.dispatch = MagicMock()
+    trainer.dispatch.get_lcm_dp_size.return_value = 1
+    padding_row = [-1] * 4
+    generator_output = {
+        "prompt_token_ids": [[1, 2], [3]],
+        "response_ids": [[4, 5, 6], [7, 8]],
+        "rewards": [[0.0, 0.0, 1.0], [0.0, 1.0]],
+        "loss_masks": [[1, 1, 0], [1, 1]],
+        "rollout_sample_support": [
+            csr([[4, 14, -1, -1], [5, 15, 25, 35], padding_row]),
+            csr([[7, -1, -1, -1], [8, 18, 28, -1]]),
+        ],
+    }
+
+    trainer.convert_to_training_input(generator_output, ["uid1", "uid2"])
+
+    assert trainer.all_metrics["generate/sample_support_size_mean"] == 2.5
+    assert trainer.all_metrics["generate/sample_support_full_fraction"] == 0.25
 
 
 def test_calculate_kl_create_experience_batched(dummy_config):
@@ -250,6 +282,83 @@ def test_calc_advantages_and_returns_step_wise_broadcast(dummy_config):
     )
     assert torch.allclose(data["advantages"], expected_advantages)
     assert torch.allclose(data["returns"], expected_advantages)
+
+
+def test_flush_pending_metrics_logs_and_clears(dummy_config):
+    """Metrics accumulated for an in-flight step are flushed to the tracker."""
+    trainer = RayPPOTrainer(
+        cfg=dummy_config,
+        tracker=None,
+        tokenizer=None,
+        train_dataset=DummyDataset(),
+        eval_dataset=DummyDataset(),
+        inference_engine_client=None,
+        generator=dummy_generator,
+    )
+    trainer.tracker = MagicMock()
+    trainer.global_step = 7
+    trainer.all_metrics = {"reward/avg_raw_reward": 0.5}
+    trainer.all_timings = {"generate": 42.0}
+
+    trainer.flush_pending_metrics()
+
+    trainer.tracker.log.assert_called_once_with(
+        {"reward/avg_raw_reward": 0.5, "timing/generate": 42.0}, step=7, commit=True
+    )
+    assert trainer.all_metrics == {}
+    assert trainer.all_timings == {}
+
+    # Second call is a no-op once the accumulators are empty.
+    trainer.flush_pending_metrics()
+    trainer.tracker.log.assert_called_once()
+
+
+def test_flush_pending_metrics_swallows_tracker_errors(dummy_config):
+    """A tracker failure during the crash-path flush must not mask the original error."""
+    trainer = RayPPOTrainer(
+        cfg=dummy_config,
+        tracker=None,
+        tokenizer=None,
+        train_dataset=DummyDataset(),
+        eval_dataset=DummyDataset(),
+        inference_engine_client=None,
+        generator=dummy_generator,
+    )
+    trainer.tracker = MagicMock()
+    trainer.tracker.log.side_effect = RuntimeError("tracker down")
+    trainer.all_metrics = {"reward/avg_raw_reward": 0.5}
+
+    trainer.flush_pending_metrics()  # must not raise
+
+    assert trainer.all_metrics == {}
+    assert trainer.all_timings == {}
+
+
+def test_run_flushes_pending_metrics_before_logging_exception():
+    """`BasePPOExp.run` flushes pending step metrics before `log_exception` finishes the wandb run."""
+    from skyrl.train.entrypoints.main_base import BasePPOExp
+
+    exp = BasePPOExp.__new__(BasePPOExp)
+    trainer = MagicMock()
+    trainer.global_step = 7
+
+    def fake_setup_trainer():
+        # Mirror _setup_trainer: expose the trainer on the exp, then crash
+        # (e.g. an OOM raised from a worker mid-step).
+        exp.trainer = trainer
+        raise RuntimeError("boom")
+
+    exp._setup_trainer = fake_setup_trainer
+
+    with pytest.raises(RuntimeError, match="boom"):
+        exp.run()
+
+    ordered_calls = [
+        name for name, _, _ in trainer.mock_calls if name in ("flush_pending_metrics", "tracker.log_exception")
+    ]
+    assert ordered_calls == ["flush_pending_metrics", "tracker.log_exception"]
+    trainer.tracker.log_exception.assert_called_once()
+    assert trainer.tracker.log_exception.call_args.kwargs["step"] == 7
 
 
 def test_micro_batches_accumulated_initialized():
@@ -522,7 +631,9 @@ def test_forward_backward_batch_calculations():
     # Mock _forward_backward_micro to track calls
     policy_forward_backward_micro_calls = []
 
-    def mock_policy_forward_backward_micro(experience, microbatch_weight, loss_fn=None, loss_fn_config=None):
+    def mock_policy_forward_backward_micro(
+        experience, microbatch_weight, loss_fn=None, loss_fn_config=None, return_per_token_outputs=True
+    ):
         policy_forward_backward_micro_calls.append(experience)
         return {"policy_loss": 0.5, "ppo_clip_ratio": 0.1, "policy_entropy": 2.0, "response_length": response_length}
 
@@ -619,3 +730,41 @@ def test_validate_batch_sizes_lcm_dp_requirement():
     # Pass: ref disabled -> requirement reduces to policy_dp. With policy_dp=2, tbs=2 is valid.
     cfg = create_config(train_batch_size=2, policy_dp=2, ref_dp=3, include_ref=False)
     validate_batch_sizes(cfg)
+
+
+@pytest.mark.parametrize(
+    "role, tp, ep, etp, expert_grid",
+    [
+        ("policy", 1, 1, None, None),
+        ("policy", 1, 8, None, 8),  # run_codecontests.sh's old MEGATRON_EP default on 2 GPUs
+        ("policy", 2, 1, None, None),  # an unset etp is tp: 2 * 1 * 1 divides 2
+        ("policy", 2, 2, None, 4),  # ... so ep=2 next to tp=2 needs 4 GPUs
+        ("policy", 2, 2, 1, None),  # an explicit etp=1 decouples the expert grid from tp
+        ("ref", 1, 8, None, 8),
+    ],
+)
+def test_validate_batch_sizes_megatron_expert_grid(role, tp, ep, etp, expert_grid):
+    """On 2 GPUs, Megatron's expert grid (pp * ep * etp) must divide the world size like the dense one,
+    for a dense model too; ``expert_grid`` is the size the error names, None when the layout is valid."""
+    cfg = SkyRLTrainConfig()
+    cfg.trainer.strategy = "megatron"
+    cfg.trainer.train_batch_size = cfg.trainer.policy_mini_batch_size = 4
+    cfg.trainer.micro_train_batch_size_per_gpu = cfg.trainer.micro_forward_batch_size_per_gpu = 1
+    cfg.trainer.placement.policy_num_gpus_per_node = cfg.trainer.placement.ref_num_gpus_per_node = 2
+    cfg.trainer.critic.model.path = None
+    cfg.trainer.algorithm.use_kl_loss = role == "ref"
+    cfg.generator.n_samples_per_prompt = 1
+    megatron_config = getattr(cfg.trainer, role).megatron_config
+    megatron_config.tensor_model_parallel_size = tp
+    megatron_config.expert_model_parallel_size = ep
+    megatron_config.expert_tensor_parallel_size = etp
+
+    if expert_grid is None:
+        validate_batch_sizes(cfg)
+    else:
+        with pytest.raises(
+            ValueError,
+            match=rf"world_size 2 should be divisible by Megatron's expert grid \(pp \* ep \* etp\) {expert_grid}\. "
+            rf"trainer\.{role}\.megatron_config\.expert_model_parallel_size",
+        ):
+            validate_batch_sizes(cfg)

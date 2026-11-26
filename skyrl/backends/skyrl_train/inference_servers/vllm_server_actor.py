@@ -3,6 +3,7 @@ vLLM Server Actor - Ray actor running a vLLM OpenAI-compatible API server.
 """
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -10,9 +11,11 @@ from argparse import Namespace
 from typing import List, Optional, Tuple
 
 import httpx
+import numpy as np
+import orjson
 import uvicorn
 import vllm.envs as envs
-from fastapi import HTTPException, Request
+from fastapi import HTTPException, Request, Response
 from ray.util.placement_group import PlacementGroup
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.async_llm_engine import AsyncLLMEngine
@@ -22,6 +25,7 @@ from vllm.entrypoints.openai.api_server import (
     init_app_state,
 )
 from vllm.inputs import TokensPrompt
+from vllm.logprobs import FlatLogprobs
 from vllm.lora.request import LoRARequest
 from vllm.sampling_params import SamplingParams as VLLMSamplingParams
 from vllm.usage.usage_lib import UsageContext
@@ -30,10 +34,25 @@ from vllm.utils.system_utils import set_ulimit
 
 from skyrl.backends.skyrl_train.inference_servers.common import (
     ServerInfo,
+    default_bind_host,
     find_and_reserve_port,
+    format_http_url,
     get_node_ip,
 )
+from skyrl.backends.skyrl_train.inference_servers.generate_wire import (
+    CLAMPED_LOGPROB,
+    PackedField,
+    build_logprobs_content,
+    pack_routed_experts,
+    pack_sample_support,
+    pack_sample_support_logprobs,
+)
 from skyrl.backends.skyrl_train.inference_servers.protocols import ServerActorProtocol
+from skyrl.backends.skyrl_train.utils.sample_support import (
+    SAMPLE_SUPPORT_DTYPE,
+    CompactSampleSupport,
+)
+from skyrl.backends.skyrl_train.weight_sync.lora_target import in_memory_lora_path
 from skyrl.env_vars import (
     SKYRL_HTTP_CONNECTION_LIMIT,
     SKYRL_VLLM_DP_PORT_OFFSET,
@@ -41,6 +60,85 @@ from skyrl.env_vars import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _multimodal_prompt(token_ids: List[int], features: dict, cache_salt: Optional[str]):
+    """The engine input for a token prompt with multimodal ``features``.
+
+    ``features`` is vLLM's ``MultiModalFeatures`` (per-modality ``mm_hashes``, ``mm_placeholders`` and
+    serialized ``kwargs_data``), as ``/inference/v1/generate`` takes it; this builds the engine input the
+    same way that endpoint does (vllm/entrypoints/scale_out/token_in_token_out/serving.py), so a caller can
+    send images to ``/skyrl/v1/generate`` and keep its routed experts and sample support.
+    """
+    from vllm.entrypoints.scale_out.token_in_token_out.mm_features import (
+        mm_kwargs_from_features,
+    )
+    from vllm.entrypoints.scale_out.token_in_token_out.protocol import (
+        MultiModalFeatures,
+    )
+    from vllm.inputs import mm_input
+    from vllm.multimodal.inputs import MultiModalKwargsItems, PlaceholderRange
+
+    parsed = MultiModalFeatures.model_validate(features)
+    placeholders = {
+        modality: [PlaceholderRange(offset=p.offset, length=p.length) for p in ranges]
+        for modality, ranges in parsed.mm_placeholders.items()
+    }
+    return mm_input(
+        prompt_token_ids=token_ids,
+        mm_kwargs=MultiModalKwargsItems(mm_kwargs_from_features(parsed)),
+        mm_hashes=parsed.mm_hashes,
+        mm_placeholders=placeholders,
+        cache_salt=cache_salt,
+    )
+
+
+def _sample_support_from_flat_logprobs(
+    logprobs: FlatLogprobs,
+    top_k: int,
+    *,
+    with_member_logprobs: bool = False,
+) -> tuple[list[dict[str, float]], CompactSampleSupport]:
+    """Extract sampled scores and post-filter CSR support from vLLM's flat rows.
+
+    Each row is ``[sampled token, top-1, ..., top-k]``; filtered candidates are ``-inf``.
+    ``with_member_logprobs`` also keeps each member's processed logprob in the support's logprob column.
+    """
+    row_width = top_k + 1
+    token_ids = np.asarray(logprobs.token_ids, dtype=SAMPLE_SUPPORT_DTYPE).reshape(-1, row_width)
+    processed_logprobs = np.asarray(logprobs.logprobs).reshape(-1, row_width)
+    sampled_logprobs_values = processed_logprobs[:, 0]
+    if not np.isfinite(sampled_logprobs_values).all():
+        raise ValueError("sample-support capture received non-finite sampled logprob(s)")
+    sampled = token_ids[:, 0]
+    candidate_ids = token_ids[:, 1:]
+    # vLLM emits filtered candidates as -inf. Treat all non-finite values
+    # (including NaN and +inf) as absent.
+    present = np.isfinite(processed_logprobs[:, 1:])
+    # vLLM's float32 logprobs round-trip exactly through the float64 array.
+    member_logprobs = processed_logprobs[:, 1:].astype(np.float32) if with_member_logprobs else None
+
+    # vLLM's approximate top-k/top-p pivot can omit the sampled token. Replace the
+    # weakest valid candidate so the row keeps its size and contains the sample.
+    rows_missing_sample = present.any(axis=1) & ~((candidate_ids == sampled[:, None]) & present).any(axis=1)
+    if np.any(rows_missing_sample):
+        rows = np.flatnonzero(rows_missing_sample)
+        weakest_col = top_k - 1 - np.argmax(present[rows, ::-1], axis=1)
+        candidate_ids = candidate_ids.copy()
+        candidate_ids[rows, weakest_col] = sampled[rows]
+        if member_logprobs is not None:
+            member_logprobs[rows, weakest_col] = sampled_logprobs_values[rows]
+        logger.warning(
+            "sample-support repair: %d token(s) had the sampled id absent from top-%d support; "
+            "overwrote the weakest member to preserve the invariant (vLLM approx top-k/top-p "
+            "pivot artifact); example: sampled token %d at row %d",
+            rows.size,
+            top_k,
+            int(sampled[rows[0]]),
+            int(rows[0]),
+        )
+    sampled_logprobs = [{"logprob": float(value)} for value in sampled_logprobs_values]
+    return sampled_logprobs, CompactSampleSupport.from_masked_rows(candidate_ids, present, member_logprobs)
 
 
 class VLLMServerActor(ServerActorProtocol):
@@ -53,7 +151,7 @@ class VLLMServerActor(ServerActorProtocol):
     called from anywhere (other actors, driver, external processes).
 
     Custom endpoints added for SkyRL:
-    - /reset_prefix_cache: Reset prefix cache
+    - /fetch_weights: Apply checkpoint-delta payloads before reload
 
     Weight sync uses vLLM native endpoints (/init_weight_transfer_engine,
     /update_weights, /get_world_size) from the RLHF router when VLLM_SERVER_DEV_MODE=1.
@@ -94,10 +192,12 @@ class VLLMServerActor(ServerActorProtocol):
         # PD disaggregation settings
         enable_pd: bool = False,
         nixl_side_channel_base: int = 5600,
+        mooncake_bootstrap_base_port: int = 50052,
         colocated_training: bool = False,
         distributed_executor_backend: str = "ray",
         mp_cuda_visible_devices: Optional[str] = None,
         enable_ray_prometheus_stats: bool = True,
+        metrics_role: Optional[str] = None,
     ):
         """
         Initialize the vLLM server actor.
@@ -115,6 +215,7 @@ class VLLMServerActor(ServerActorProtocol):
             dp_rpc_port: DP RPC port (for non-rank-0 servers)
             enable_pd: Enable prefill-decode disaggregation
             nixl_side_channel_base: Base port for NIXL side channel to start searching for a free port
+            mooncake_bootstrap_base_port: Base port for Mooncake bootstrap server to start searching for a free port
             colocated_training: Whether the server is colocated with training workers
             distributed_executor_backend: vLLM distributed executor backend.
                 ``"ray"`` spawns TP/PP workers as Ray tasks (default).
@@ -128,6 +229,7 @@ class VLLMServerActor(ServerActorProtocol):
                 through ``RayPrometheusStatLogger`` so they land in Ray's
                 per-node metrics agent (and thus Anyscale's hosted Prometheus +
                 Grafana).
+            metrics_role: Prefill/decode role exposed to external metrics collectors.
         """
         from skyrl.train.utils.ray_logging import redirect_actor_output_to_file
 
@@ -140,6 +242,7 @@ class VLLMServerActor(ServerActorProtocol):
         self._num_gpus_per_server = self.compute_num_gpus_per_server(vllm_cli_args)
         self._use_mp_backend = distributed_executor_backend == "mp"
         self._enable_ray_prometheus_stats = enable_ray_prometheus_stats
+        self._metrics_role = metrics_role
 
         # Ensure vLLM sleep endpoints are enabled by using dev mode
         os.environ["VLLM_SERVER_DEV_MODE"] = "1"
@@ -152,18 +255,49 @@ class VLLMServerActor(ServerActorProtocol):
         self._cli_args.distributed_executor_backend = distributed_executor_backend
 
         # Update args with our assigned host/port
-        self._cli_args.host = "0.0.0.0"
+        self._cli_args.host = default_bind_host(self._ip)
         self._cli_args.port = self._port
 
-        # PD disaggregation: setup NIXL side channel for KV transfer
+        # PD disaggregation: setup the KV-transfer side channel for the P2P
+        # connector (NIXL side channel or Mooncake bootstrap server).
         self._nixl_port_reservation = None
         self._nixl_side_channel_base = None
+        # Mooncake bootstrap server base port and reservation
+        self._mooncake_bootstrap_server_port = None
+        self._mooncake_port_reservation = None
         if enable_pd:
-            # use nixl_side_channel_base + server_idx as convention for the start port for this server
-            self._nixl_side_channel_base, self._nixl_port_reservation = find_and_reserve_port(
-                nixl_side_channel_base + server_idx
+            from skyrl.backends.skyrl_train.inference_servers.utils import (
+                get_pd_p2p_connector_name,
             )
-            self._setup_nixl_side_channel(self._nixl_side_channel_base)
+
+            # Handle both dict and JSON string formats for kv_transfer_config
+            kv_config = getattr(self._cli_args, "kv_transfer_config", None)
+            if kv_config is not None and isinstance(kv_config, str):
+                try:
+                    kv_config = json.loads(kv_config)
+                except (json.JSONDecodeError, TypeError) as e:
+                    raise ValueError(
+                        f"Invalid kv_transfer_config: expected valid JSON string or dict, "
+                        f"got {type(kv_config).__name__}: {e}"
+                    ) from e
+                self._cli_args.kv_transfer_config = kv_config
+            p2p_connector = get_pd_p2p_connector_name(kv_config) if kv_config else "NixlConnector"
+
+            if p2p_connector == "MooncakeConnector":
+                # Each external-LB instance launches its own bootstrap HTTP
+                # server bound at exactly VLLM_MOONCAKE_BOOTSTRAP_PORT
+                # The router is given the same port per prefill server
+                # via server info returned by `.start`
+                self._mooncake_bootstrap_server_port, self._mooncake_port_reservation = find_and_reserve_port(
+                    mooncake_bootstrap_base_port
+                )
+                self._setup_mooncake_port(self._mooncake_bootstrap_server_port)
+            else:
+                # use nixl_side_channel_base to start searching for a free port for this server
+                self._nixl_side_channel_base, self._nixl_port_reservation = find_and_reserve_port(
+                    nixl_side_channel_base
+                )
+                self._setup_nixl_side_channel(self._nixl_side_channel_base)
 
         # Each engine needs to know its dp_rank and dp_size so DP process groups are formed
         if dp_size > 0:
@@ -202,7 +336,6 @@ class VLLMServerActor(ServerActorProtocol):
             logger.info(f"Server {server_idx}: using bundle indices {bundle_indices}")
 
         # Initialized lazily to not block the actor initialization.
-        self._engine: Optional[AsyncLLMEngine] = None
         self._server_task: Optional[asyncio.Task] = None
 
     def _setup_mp_gpu_visibility(self, mp_cuda_visible_devices: Optional[str]) -> None:
@@ -231,7 +364,6 @@ class VLLMServerActor(ServerActorProtocol):
 
         Each server instance needs a unique side channel port for KV transfer handshake.
         """
-        import json
 
         os.environ["VLLM_NIXL_SIDE_CHANNEL_PORT"] = str(side_channel_port)
         os.environ["VLLM_NIXL_SIDE_CHANNEL_HOST"] = self._ip
@@ -240,15 +372,6 @@ class VLLMServerActor(ServerActorProtocol):
 
         if hasattr(self._cli_args, "kv_transfer_config") and self._cli_args.kv_transfer_config:
             kv_config = self._cli_args.kv_transfer_config
-            # Handle both dict and JSON string formats
-            if isinstance(kv_config, str):
-                try:
-                    kv_config = json.loads(kv_config)
-                except (json.JSONDecodeError, TypeError) as e:
-                    raise ValueError(
-                        f"Invalid kv_transfer_config: expected valid JSON string or dict, "
-                        f"got {type(self._cli_args.kv_transfer_config).__name__}: {e}"
-                    ) from e
             kv_config["engine_id"] = engine_id
             self._cli_args.kv_transfer_config = kv_config
 
@@ -257,9 +380,34 @@ class VLLMServerActor(ServerActorProtocol):
             f"host={self._ip}, port={side_channel_port}, engine_id={engine_id}"
         )
 
+    def _setup_mooncake_port(self, mooncake_server_port: int) -> None:
+        """Setup Mooncake bootstrap server port for P/D"""
+        os.environ["VLLM_MOONCAKE_BOOTSTRAP_PORT"] = str(mooncake_server_port)
+        engine_id = f"server-{self._server_idx}-{self._ip}-{mooncake_server_port}"
+
+        if hasattr(self._cli_args, "kv_transfer_config") and self._cli_args.kv_transfer_config:
+            kv_config = self._cli_args.kv_transfer_config
+            kv_config["engine_id"] = engine_id
+            self._cli_args.kv_transfer_config = kv_config
+
+        logger.info(
+            f"Server {self._server_idx}: Mooncake PD bootstrap port configured -"
+            f"host={self._ip}, port={mooncake_server_port}, engine_id={engine_id}"
+        )
+
+    def get_ray_worker_id(self) -> str:
+        """Return the Ray worker ID of the actor process hosting this API server."""
+        import ray
+
+        return ray.get_runtime_context().get_worker_id()
+
     def get_server_info(self) -> ServerInfo:
         """Get the server's IP and port info."""
-        return ServerInfo(ip=self._ip, port=self._port)
+        return ServerInfo(
+            ip=self._ip,
+            port=self._port,
+            mooncake_bootstrap_server_port=self._mooncake_bootstrap_server_port,
+        )
 
     def get_dp_info(self) -> Tuple[str, int]:
         """Get the DP master address and RPC port (for server 0 to share with others)."""
@@ -282,7 +430,7 @@ class VLLMServerActor(ServerActorProtocol):
 
     async def _wait_until_healthy(self, timeout: float = SKYRL_WAIT_UNTIL_INFERENCE_SERVER_HEALTHY_TIMEOUT_S) -> None:
         """Poll the /health endpoint until it responds OK."""
-        url = f"http://{self._ip}:{self._port}/health"
+        url = format_http_url(self._ip, self._port, "/health")
         start_time = time.time()
 
         async with httpx.AsyncClient() as client:
@@ -318,66 +466,50 @@ class VLLMServerActor(ServerActorProtocol):
             self._nixl_port_reservation.close()
             self._nixl_port_reservation = None
 
-        sock_addr = (self._cli_args.host, self._cli_args.port)
-        sock = create_server_socket(sock_addr)
-        app = build_app(self._cli_args)
+        if self._mooncake_port_reservation is not None:
+            self._mooncake_port_reservation.close()
+            self._mooncake_port_reservation = None
 
-        # Initialize the engine (this loads the model - takes time)
-        engine_args = AsyncEngineArgs.from_cli_args(self._cli_args)
-
-        stat_loggers = None
-        if self._enable_ray_prometheus_stats:
-            from vllm.v1.metrics.ray_wrappers import RayPrometheusStatLogger
-
-            logger.info("Enabling RayPrometheusStatLogger for vLLM engine metrics")
-            stat_loggers = [RayPrometheusStatLogger]
-
-        self._engine = AsyncLLMEngine.from_engine_args(
-            engine_args=engine_args,
-            usage_context=UsageContext.OPENAI_API_SERVER,
-            stat_loggers=stat_loggers,
+        await _build_and_serve_vllm_server(
+            self._cli_args,
+            enable_ray_prometheus_stats=self._enable_ray_prometheus_stats,
+            metrics_role=self._metrics_role,
         )
-        logger.info(f"Engine initialized on {self._ip}:{self._port}, adding custom endpoints...")
 
-        # Add custom SkyRL endpoints
-        self._add_custom_endpoints(app)
+    @staticmethod
+    def _add_custom_endpoints(app, engine, cli_args, metrics_info=None) -> None:
+        """Add custom SkyRL endpoints to the FastAPI app.
 
-        await init_app_state(self._engine, app.state, self._cli_args)
+        Shared by the Ray-actor deployment and the standalone ``python -m``
+        entrypoint, so it takes the engine and CLI args explicitly rather than
+        reading them off ``self``.
+        """
+        # Most weight-sync endpoints are registered by vLLM dev mode. SkyRL
+        # adds /fetch_weights because checkpoint-delta pulls and applies
+        # payloads before the paused /update_weights reload.
 
-        # Use uvicorn directly (serve_http tries to add signal handlers which fails in Ray actors)
-        config = uvicorn.Config(
-            app,
-            host=self._cli_args.host,
-            port=self._cli_args.port,
-            log_level=self._cli_args.uvicorn_log_level,
-            timeout_keep_alive=envs.VLLM_HTTP_TIMEOUT_KEEP_ALIVE,
-            backlog=SKYRL_HTTP_CONNECTION_LIMIT,
-            ssl_keyfile=self._cli_args.ssl_keyfile,
-            ssl_certfile=self._cli_args.ssl_certfile,
-            ssl_ca_certs=self._cli_args.ssl_ca_certs,
-            ssl_cert_reqs=self._cli_args.ssl_cert_reqs,
-            access_log=not getattr(self._cli_args, "disable_uvicorn_access_log", False),
-        )
-        server = uvicorn.Server(config)
-        # vllm's engine_error_handler reads app.state.server to call
-        # terminate_if_errored; normally wired up by vllm's own launcher.
-        app.state.server = server
-        await server.serve(sockets=[sock])
+        if metrics_info is not None:
 
-    def _add_custom_endpoints(self, app) -> None:
-        """Add custom SkyRL endpoints to the FastAPI app."""
-        engine = self._engine
-        cli_args = self._cli_args
+            @app.get("/get_metrics_worker_info")
+            async def _metrics_worker_info():
+                """Identify the Ray frontend exporting this server's engine metrics."""
+                return Response(content=orjson.dumps(metrics_info), media_type="application/json")
 
-        # Weight sync uses vLLM native endpoints (/init_weight_transfer_engine,
-        # /update_weights, /get_world_size) registered by the RLHF router when
-        # VLLM_SERVER_DEV_MODE=1.
+        @app.post("/fetch_weights")
+        async def _fetch_weights(request: Request):
+            """Fetch/apply checkpoint-delta payloads before the paused reload phase."""
+            body = await request.json()
+            target_version = body.get("target_version")
+            if target_version is None:
+                raise HTTPException(status_code=400, detail="'target_version' is required")
 
-        @app.post("/reset_prefix_cache")
-        async def _reset_prefix_cache(request: Request):
-            """Reset the prefix cache."""
-            await engine.reset_prefix_cache()
-            return {"status": "ok"}
+            kwargs = {"target_version": int(target_version)}
+            if body.get("sync_dir") is not None:
+                kwargs["sync_dir"] = body["sync_dir"]
+            if body.get("uri") is not None:
+                kwargs["uri"] = body["uri"]
+            result = await engine.collective_rpc("fetch_weights", kwargs=kwargs)
+            return {"status": "ok", "result": result}
 
         @app.post("/skyrl/v1/load_lora_adapter")
         async def _skyrl_load_lora_adapter(request: Request):
@@ -391,11 +523,18 @@ class VLLMServerActor(ServerActorProtocol):
             body = await request.json()
             lora_name = body.get("lora_name")
             lora_path = body.get("lora_path")
-            if not lora_name or not lora_path:
+            in_memory = bool(body.get("in_memory", False))
+            if not lora_name or (in_memory == bool(lora_path)):
                 raise HTTPException(
                     status_code=400,
-                    detail="Both 'lora_name' and 'lora_path' must be provided.",
+                    detail="'lora_name' plus exactly one of 'lora_path' or 'in_memory': true must be provided.",
                 )
+            if in_memory:
+                # Tensors were staged in every worker by the preceding weight
+                # update (armed with a LoRA receive target); the patched worker
+                # LoRA manager builds the adapter from them when it sees this
+                # marker path.
+                lora_path = in_memory_lora_path(lora_name)
 
             models = request.app.state.openai_serving_models
             async with models.lora_resolver_lock[lora_name]:
@@ -420,25 +559,77 @@ class VLLMServerActor(ServerActorProtocol):
                 "lora_int_id": lora_int_id,
             }
 
-        # NOTE (sumanthrh): We use a custom generate endpoint /skyrl/v1/generate because the native
-        # endpoint /inference/v1/generate does not support returning routed expert IDs.
-        # TODO (sumanthrh): Migrate back to /inference/v1/generate once this is fixed on the vllm side
+        # NOTE (sumanthrh): We use a custom generate endpoint /skyrl/v1/generate as a temporary state
+        # since the native /inference/v1/generate endpoint does not support sample-support capture with flashinfer
+        # TODO (sumanthrh): Migrate back to /inference/v1/generate once flashinfer is supported with returning top-k logprobs.
         @app.post("/skyrl/v1/generate")
         async def _skyrl_generate(request: Request):
-            """SkyRL generate endpoint that returns routed_experts alongside token output."""
-            if getattr(cli_args, "enable_lora", False):
-                raise HTTPException(status_code=400, detail="/skyrl/v1/generate does not support LoRA.")
+            """SkyRL generate endpoint that returns routed_experts alongside token output.
 
+            Like ``/inference/v1/generate``, a request may carry multimodal ``features`` (images) for its
+            token prompt.
+            """
             body = await request.json()
+
+            # Resolve `model` to a loaded LoRA adapter, as the native endpoint does
+            # (`OpenAIServing._maybe_get_adapters`). Looked up per request so an
+            # in-place adapter reload is picked up on the next generate.
+            lora_request = None
+            model_name = body.get("model")
+            if getattr(cli_args, "enable_lora", False) and model_name:
+                models = request.app.state.openai_serving_models
+                if model_name in models.lora_requests:
+                    lora_request = models.lora_requests[model_name]
+                elif not models.is_base_model(model_name):
+                    raise HTTPException(status_code=404, detail=f"The model `{model_name}` does not exist.")
+
             token_ids = body["token_ids"]
             sampling_params_dict = body.get("sampling_params", {})
+            cache_salt = body.get("cache_salt")
 
+            capture_sample_support = body.get("return_sample_support", False)
+            capture_sample_support_logprobs = body.get("return_sample_support_logprobs", False)
+            if capture_sample_support_logprobs and not capture_sample_support:
+                raise HTTPException(
+                    status_code=400,
+                    detail="return_sample_support_logprobs requires return_sample_support",
+                )
+            if capture_sample_support:
+                # Sample support requires a bounded, non-degenerate top-k set.
+                top_k = sampling_params_dict.get("top_k")
+                if not isinstance(top_k, int) or top_k <= 1:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "return_sample_support requires sampling_params.top_k > 1, got "
+                            f"{top_k!r}. Sample-support capture is opt-in per request."
+                        ),
+                    )
+                sampling_params_dict["flat_logprobs"] = True
+                sampling_params_dict["logprobs"] = top_k
+                # This endpoint returns token ids only, so the API-server process need not detokenize
+                # the k + 1 candidates per token; that work otherwise starves the event loop that also
+                # serves pause/weight-sync. Stop strings still need the decoded text.
+                if not sampling_params_dict.get("stop"):
+                    sampling_params_dict.setdefault("detokenize", False)
             sampling_params = VLLMSamplingParams(**sampling_params_dict)
-            prompt = TokensPrompt(prompt_token_ids=token_ids)
+            # `cache_salt` salts vLLM's prefix cache; vLLM rejects an empty salt, so attach only when set.
+            features = body.get("features")
+            if features is not None:
+                try:
+                    prompt = _multimodal_prompt(token_ids, features, cache_salt)
+                # pydantic's ValidationError and undecodable items are ValueErrors; an item that decodes to
+                # something other than a serialized MultiModalKwargsItem raises AttributeError or TypeError.
+                except (ValueError, TypeError, AttributeError) as error:
+                    raise HTTPException(status_code=400, detail=f"invalid features: {error}") from error
+            elif cache_salt is not None:
+                prompt = TokensPrompt(prompt_token_ids=token_ids, cache_salt=cache_salt)
+            else:
+                prompt = TokensPrompt(prompt_token_ids=token_ids)
             request_id = random_uuid()
 
             final_res = None
-            async for res in engine.generate(prompt, sampling_params, request_id=request_id):
+            async for res in engine.generate(prompt, sampling_params, request_id=request_id, lora_request=lora_request):
                 final_res = res
 
             if final_res is None:
@@ -449,33 +640,44 @@ class VLLMServerActor(ServerActorProtocol):
             finish_reason = resp.finish_reason
 
             logprobs = None
-            if resp.logprobs is not None:
-                content = []
-                for tid, lp_dict in zip(token_ids_out, resp.logprobs):
-                    if lp_dict and tid in lp_dict:
-                        content.append({"logprob": lp_dict[tid].logprob})
-                    else:
-                        # -9999.0 is the default in vLLM's ChatCompletionLogProb
-                        content.append({"logprob": -9999.0})
+            packed_sample_support = None
+            packed_sample_support_logprobs = None
+            if capture_sample_support:
+                content, sample_support = _sample_support_from_flat_logprobs(
+                    resp.logprobs,
+                    sampling_params_dict["top_k"],
+                    with_member_logprobs=capture_sample_support_logprobs,
+                )
+                logprobs = {"content": content}
+                packed_sample_support = pack_sample_support(sample_support)
+                if capture_sample_support_logprobs:
+                    packed_sample_support_logprobs = pack_sample_support_logprobs(sample_support)
+            elif resp.logprobs is not None:
+                content, num_clamped = build_logprobs_content(token_ids_out, resp.logprobs)
+                if num_clamped:
+                    logger.warning(
+                        f"request {request_id}: clamped {num_clamped}/{len(token_ids_out)} missing or "
+                        f"non-finite sampled logprobs to {CLAMPED_LOGPROB}"
+                    )
                 logprobs = {"content": content}
 
             routed_experts = None
             if resp.routed_experts is not None:
-                if hasattr(resp.routed_experts, "tolist"):
-                    routed_experts = resp.routed_experts.tolist()
-                else:
-                    routed_experts = resp.routed_experts
+                routed_experts = pack_routed_experts(resp.routed_experts)
 
-            return {
+            payload = {
                 "choices": [
                     {
                         "token_ids": token_ids_out,
                         "finish_reason": finish_reason,
                         "logprobs": logprobs,
-                        "routed_experts": routed_experts,
+                        PackedField.ROUTED_EXPERTS.value: routed_experts,
+                        PackedField.ROLLOUT_SAMPLE_SUPPORT.value: packed_sample_support,
+                        PackedField.ROLLOUT_SAMPLE_SUPPORT_LOGPROBS.value: packed_sample_support_logprobs,
                     }
                 ]
             }
+            return Response(content=orjson.dumps(payload), media_type="application/json")
 
     async def shutdown(self) -> None:
         """Gracefully shutdown the server."""
@@ -485,3 +687,150 @@ class VLLMServerActor(ServerActorProtocol):
                 await self._server_task
             except asyncio.CancelledError:
                 pass
+
+
+async def _build_and_serve_vllm_server(
+    cli_args: Namespace,
+    *,
+    enable_ray_prometheus_stats: bool = False,
+    metrics_role: Optional[str] = None,
+) -> None:
+    """Build the vLLM OpenAI app + engine, register SkyRL custom endpoints, and
+    serve with uvicorn. Blocks until the server stops.
+
+    Shared by ``VLLMServerActor._run_server`` (Ray-actor deployment) and the
+    standalone ``python -m`` entrypoint below.
+    """
+    sock_addr = (cli_args.host, cli_args.port)
+    # One uvicorn per port (no api_server_count fan-out), matching vLLM's own
+    # single-server path, so SO_REUSEPORT stays off.
+    sock = create_server_socket(sock_addr, reuse_port=False)
+
+    # SkyRL uses the scale-out token-in/token-out endpoint for generation.
+    cli_args.enable_scale_out = True
+    app = build_app(cli_args)
+
+    if getattr(cli_args, "enable_return_routed_experts", False) and cli_args.pipeline_parallel_size > 1:
+        from skyrl.backends.skyrl_train.patches.vllm.patch_routed_experts_pp_relay import (
+            PP_RELAY_ENV,
+            apply_pp_relay_config_patch,
+        )
+
+        # R3 with PP > 1: lift vLLM's rejection before the engine config is validated here. The engine core
+        # validates the config again in its own process; the env var makes SkyRL's `vllm.general_plugins`
+        # entry point install the same patch there. The workers install the relay itself.
+        os.environ[PP_RELAY_ENV] = "1"
+        apply_pp_relay_config_patch()
+
+    # Initialize the engine (this loads the model - takes time)
+    engine_args = AsyncEngineArgs.from_cli_args(cli_args)
+    # Standalone parsing can leave the CUDA worker class unresolved.
+    if engine_args.worker_cls == "auto":
+        engine_args.worker_cls = "vllm.v1.worker.gpu_worker.Worker"
+
+    stat_loggers = None
+    if enable_ray_prometheus_stats:
+        from vllm.v1.metrics.ray_wrappers import RayPrometheusStatLogger
+
+        logger.info("Enabling RayPrometheusStatLogger for vLLM engine metrics")
+        stat_loggers = [RayPrometheusStatLogger]
+
+    engine = AsyncLLMEngine.from_engine_args(
+        engine_args=engine_args,
+        usage_context=UsageContext.OPENAI_API_SERVER,
+        stat_loggers=stat_loggers,
+    )
+    logger.info(f"Engine initialized on {cli_args.host}:{cli_args.port}, adding custom endpoints...")
+
+    # Add custom SkyRL endpoints
+    metrics_info = None
+    if enable_ray_prometheus_stats:
+        import ray
+
+        metrics_info = {"worker_id": ray.get_runtime_context().get_worker_id(), "role": metrics_role}
+    VLLMServerActor._add_custom_endpoints(app, engine, cli_args, metrics_info=metrics_info)
+
+    await init_app_state(engine, app.state, cli_args)
+
+    # Use uvicorn directly (serve_http tries to add signal handlers which fails in Ray actors)
+    config = uvicorn.Config(
+        app,
+        host=cli_args.host,
+        port=cli_args.port,
+        log_level=cli_args.uvicorn_log_level,
+        timeout_keep_alive=envs.VLLM_HTTP_TIMEOUT_KEEP_ALIVE,
+        backlog=SKYRL_HTTP_CONNECTION_LIMIT,
+        ssl_keyfile=cli_args.ssl_keyfile,
+        ssl_certfile=cli_args.ssl_certfile,
+        ssl_ca_certs=cli_args.ssl_ca_certs,
+        ssl_cert_reqs=cli_args.ssl_cert_reqs,
+        access_log=not getattr(cli_args, "disable_uvicorn_access_log", False),
+    )
+    server = uvicorn.Server(config)
+    # vllm's engine_error_handler reads app.state.server to call
+    # terminate_if_errored; normally wired up by vllm's own launcher.
+    app.state.server = server
+    await server.serve(sockets=[sock])
+
+
+def _build_standalone_cli_args(argv: Optional[List[str]] = None) -> Namespace:
+    """Parse vLLM OpenAI-server CLI args for the standalone server entrypoint.
+
+    Mirrors the parser used by ``vllm.entrypoints.openai.api_server`` (frontend
+    args + async engine args), so any flag the upstream server accepts works here
+    too (``--model``, ``--tensor-parallel-size``, ``--host``, ``--port``,
+    ``--worker-extension-cls``, ...).
+    """
+    from vllm import AsyncEngineArgs as _AsyncEngineArgs
+    from vllm.entrypoints.common.cli_args import FrontendArgs
+    from vllm.platforms import current_platform
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+    from skyrl.backends.skyrl_train.inference_servers.utils import VLLM_LOGPROBS_MODE
+
+    # See build_vllm_cli_args: pin the device type so arg parsing's DeviceConfig
+    # autodetection succeeds even before CUDA is fully initialized.
+    if not current_platform.device_type:
+        current_platform.device_type = "cuda"
+
+    parser = FlexibleArgumentParser(
+        description="SkyRL standalone vLLM OpenAI-compatible server (with SkyRL weight-sync endpoints)."
+    )
+    parser = FrontendArgs.add_cli_args(parser)
+    parser = _AsyncEngineArgs.add_cli_args(parser)
+    # Matches build_vllm_cli_args: logprobs are computed from the sampling distribution.
+    parser.set_defaults(logprobs_mode=VLLM_LOGPROBS_MODE)
+    args = parser.parse_args(argv)
+    if args.logprobs_mode != VLLM_LOGPROBS_MODE:
+        parser.error(f"--logprobs-mode must be {VLLM_LOGPROBS_MODE!r}, got {args.logprobs_mode!r}.")
+    return args
+
+
+def main(argv: Optional[List[str]] = None) -> None:
+    """Standalone entrypoint: run a vLLM OpenAI server with SkyRL's custom
+    endpoints (plus vLLM's native dev/weight-transfer endpoints), without Ray.
+
+    Used for external rollout-server deployments (e.g. the Thunder agent), where
+    servers are launched directly with ``python -m`` and pinned to GPUs via
+    ``CUDA_VISIBLE_DEVICES`` rather than a Ray placement group. Ray-actor-only
+    concerns (placement-group bundle indices, DP master rendezvous) do not apply
+    here; pass standard vLLM flags to control parallelism and placement.
+    """
+    # Match VLLMServerActor.__init__: enable vLLM dev-mode endpoints
+    # (sleep/wake, /init_weight_transfer_engine, /collective_rpc,
+    # /get_world_size), SkyRL /fetch_weights, runtime LoRA load/unload, and
+    # CUDA-IPC weight transfer.
+    os.environ["VLLM_SERVER_DEV_MODE"] = "1"
+    os.environ["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "1"
+    os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
+
+    cli_args = _build_standalone_cli_args(argv)
+    if not cli_args.host:
+        cli_args.host = default_bind_host(get_node_ip())
+    set_ulimit()
+    logger.info(f"Starting standalone SkyRL vLLM server on {cli_args.host}:{cli_args.port}")
+    asyncio.run(_build_and_serve_vllm_server(cli_args, enable_ray_prometheus_stats=False))
+
+
+if __name__ == "__main__":
+    main()

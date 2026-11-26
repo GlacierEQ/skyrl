@@ -1,0 +1,368 @@
+import inspect
+import sys
+import types
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from skyrl.backends.skyrl_train.distributed.megatron.token_metadata import (
+    build_token_metadata_layout,
+)
+from skyrl.backends.skyrl_train.utils import replay_utils
+from skyrl.backends.skyrl_train.utils.packed_tensor import PackedTensor
+from skyrl.backends.skyrl_train.utils.replay_utils import make_replay_padding_indices
+
+
+def _pack_routes(routes: torch.Tensor, attention_mask: torch.Tensor) -> PackedTensor:
+    """Pack a ``[batch, seq_len, layers, topk]`` fixture to its real tokens."""
+    return PackedTensor.from_segments([routes[row][attention_mask[row].bool()] for row in range(routes.shape[0])])
+
+
+class _Replay:
+    """A megatron-core ``RouterReplay`` instance, as replay setup uses it."""
+
+    def __init__(self, is_mtp_layer=False):
+        self.is_mtp_layer = is_mtp_layer
+        self.target_topk_idx = self.router_replay_action = None
+
+    def set_target_indices(self, indices):
+        self.target_topk_idx = indices
+
+
+def _install_router_replay(monkeypatch, instances):
+    """Stub megatron-core's ``RouterReplay`` registry over ``instances``; returns ``RouterReplayAction``."""
+
+    class RouterReplay:
+        @staticmethod
+        def get_instances(is_mtp_layer=None):
+            return [r for r in instances if is_mtp_layer is None or r.is_mtp_layer == is_mtp_layer]
+
+        @staticmethod
+        def set_global_router_replay_action(action, *, is_mtp_layer=None):
+            for router in RouterReplay.get_instances(is_mtp_layer):
+                router.router_replay_action = action
+
+    module = types.ModuleType("megatron.core.transformer.moe.router_replay")
+    module.RouterReplay = RouterReplay
+    module.RouterReplayAction = SimpleNamespace(REPLAY_FORWARD="replay_forward", REPLAY_BACKWARD="replay_backward")
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    return module.RouterReplayAction
+
+
+@pytest.fixture
+def parallel_state(monkeypatch):
+    try:
+        import megatron.core.parallel_state as mpu
+    except ModuleNotFoundError:
+        megatron = types.ModuleType("megatron")
+        core = types.ModuleType("megatron.core")
+        mpu = types.ModuleType("megatron.core.parallel_state")
+        megatron.core = core
+        core.parallel_state = mpu
+        monkeypatch.setitem(sys.modules, "megatron", megatron)
+        monkeypatch.setitem(sys.modules, "megatron.core", core)
+        monkeypatch.setitem(sys.modules, "megatron.core.parallel_state", mpu)
+
+    monkeypatch.setattr(mpu, "get_tensor_model_parallel_world_size", lambda: 1, raising=False)
+    monkeypatch.setattr(mpu, "get_context_parallel_world_size", lambda: 1, raising=False)
+    monkeypatch.setattr(mpu, "get_context_parallel_rank", lambda: 0, raising=False)
+    return mpu
+
+
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.int16, torch.int32])
+def test_replay_padding_indices_are_unique(dtype):
+    padding = make_replay_padding_indices((2, 3, 4, 3), dtype=dtype)
+
+    assert padding.shape == (2, 3, 4, 3)
+    assert torch.equal(padding, torch.tensor([0, 1, 2], dtype=dtype).expand_as(padding))
+
+
+@pytest.mark.parametrize("shape", [(), (2, 3, 4, 0)])
+def test_replay_padding_rejects_missing_topk(shape):
+    with pytest.raises(ValueError, match="positive topk"):
+        make_replay_padding_indices(shape, dtype=torch.uint8)
+
+
+@pytest.mark.parametrize("batch_size", [1, 2, 3])
+@pytest.mark.parametrize("tp_size", [1, 2, 8])
+def test_replay_indices_match_router_token_order(batch_size, tp_size):
+    routes = torch.arange(batch_size * 16 * 2 * 2).reshape(batch_size, 16, 2, 2)
+    for local_routes in routes.chunk(tp_size, dim=1):
+        per_layer = replay_utils._split_replay_indices(local_routes)
+        for layer, actual in enumerate(per_layer):
+            expected = torch.stack(
+                [local_routes[batch, pos, layer] for pos in range(local_routes.shape[1]) for batch in range(batch_size)]
+            ).to(torch.int32)
+            torch.testing.assert_close(actual, expected)
+
+
+def test_replay_has_no_dispatcher_specific_patch():
+    assert "TokenDispatcher" not in inspect.getsource(replay_utils)
+
+
+@pytest.mark.parametrize("route_dtype", [torch.uint8, torch.int16, torch.int32])
+def test_setup_replay_installs_indices_and_returns_model_mask(monkeypatch, parallel_state, route_dtype):
+    router = _Replay()
+    RouterReplayAction = _install_router_replay(monkeypatch, [router])
+    monkeypatch.setattr(replay_utils, "_get_current_pp_stage_layer_range", lambda model_config: (1, 1))
+    monkeypatch.setattr(
+        replay_utils,
+        "scatter_router_padding_mask_for_model",
+        lambda mask, model, model_config: mask,
+    )
+    apply_layout = replay_utils.align_packed_token_metadata
+    routed_layer_counts = []
+
+    def record_routed_layer_count(metadata, layout, padding_value):
+        routed_layer_counts.append(metadata.row_shape[0])
+        return apply_layout(metadata, layout, padding_value)
+
+    monkeypatch.setattr(replay_utils, "align_packed_token_metadata", record_routed_layer_count)
+
+    routes = torch.tensor(
+        [
+            [
+                [[0, 1], [0, 1], [0, 1]],
+                [[10, 11], [1, 2], [20, 21]],
+                [[12, 13], [3, 4], [22, 23]],
+                [[14, 15], [5, 6], [24, 25]],
+            ]
+        ],
+        dtype=route_dtype,
+    )
+    attention_mask = torch.tensor([[0, 1, 1, 1]])
+    router_padding_mask = torch.tensor([[1, 0, 0, 1]], dtype=torch.bool)
+    metadata_layout = build_token_metadata_layout(
+        attention_mask,
+        routes.device,
+        packed=False,
+        fp8_enabled=False,
+    )
+
+    model_kwargs = replay_utils.setup_per_microbatch_replay_forward(
+        _pack_routes(routes, attention_mask),
+        router_padding_mask,
+        attention_mask,
+        model=object(),
+        model_config=SimpleNamespace(fp8=None),
+        metadata_layout=metadata_layout,
+    )
+
+    assert router.target_topk_idx.tolist() == [[1, 2], [3, 4], [5, 6]]
+    assert router.target_topk_idx.dtype == torch.int32
+    assert router.router_replay_action == RouterReplayAction.REPLAY_FORWARD
+    assert model_kwargs["padding_mask"].tolist() == [[False, False, True]]
+    assert routed_layer_counts == [1]
+
+
+def test_replay_setup_leaves_mtp_routers_alone(monkeypatch, parallel_state):
+    """Replay installs routes and actions on the trunk's routers only; an MTP head's router keeps routing itself."""
+    trunk_routers = [_Replay(), _Replay()]
+    mtp_router = _Replay(is_mtp_layer=True)
+    RouterReplayAction = _install_router_replay(monkeypatch, [*trunk_routers, mtp_router])
+    monkeypatch.setattr(replay_utils, "_get_current_pp_stage_layer_range", lambda model_config: (0, 2))
+    monkeypatch.setattr(
+        replay_utils,
+        "scatter_router_padding_mask_for_model",
+        lambda mask, model, model_config: mask,
+    )
+
+    # Two captured layers, one per trunk router. vLLM captures no route for the MTP head.
+    routes = torch.tensor([[[[1, 2], [11, 12]], [[3, 4], [13, 14]], [[5, 6], [15, 16]]]], dtype=torch.int16)
+    attention_mask = torch.ones((1, 3), dtype=torch.long)
+    metadata_layout = build_token_metadata_layout(attention_mask, routes.device, packed=False, fp8_enabled=False)
+
+    replay_utils.setup_per_microbatch_replay_forward(
+        _pack_routes(routes, attention_mask),
+        torch.zeros((1, 3), dtype=torch.bool),
+        attention_mask,
+        model=object(),
+        model_config=SimpleNamespace(fp8=None),
+        metadata_layout=metadata_layout,
+    )
+
+    assert [router.target_topk_idx.tolist() for router in trunk_routers] == [
+        [[1, 2], [3, 4], [5, 6]],
+        [[11, 12], [13, 14], [15, 16]],
+    ]
+    assert [router.router_replay_action for router in trunk_routers] == [RouterReplayAction.REPLAY_FORWARD] * 2
+    assert mtp_router.target_topk_idx is None
+    assert mtp_router.router_replay_action is None
+
+    replay_utils.setup_per_microbatch_replay_backward()
+
+    assert [router.router_replay_action for router in trunk_routers] == [RouterReplayAction.REPLAY_BACKWARD] * 2
+    assert mtp_router.router_replay_action is None
+
+
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_replay_indices_are_dtype_independent(monkeypatch, parallel_state, packed, tp_size):
+    """Compact host routes must produce the same int32 replay data as int32 routes."""
+    routers = [_Replay(), _Replay()]
+    _install_router_replay(monkeypatch, routers)
+    monkeypatch.setattr(replay_utils, "_get_current_pp_stage_layer_range", lambda model_config: (1, 2))
+    monkeypatch.setattr(
+        replay_utils,
+        "scatter_router_padding_mask_for_model",
+        lambda mask, model, model_config: mask,
+    )
+    monkeypatch.setattr(parallel_state, "get_tensor_model_parallel_world_size", lambda: tp_size, raising=False)
+    monkeypatch.setattr(parallel_state, "get_tensor_model_parallel_rank", lambda: tp_size - 1, raising=False)
+
+    batch, seq_len, num_layers, topk = 2, 8, 4, 2
+    base = torch.arange(batch * seq_len * num_layers * topk, dtype=torch.int32) % 4096 + 256
+    routes_int32 = base.reshape(batch, seq_len, num_layers, topk)
+    routes_int16 = routes_int32.to(torch.int16)
+
+    attention_mask = torch.ones((batch, seq_len), dtype=torch.long)
+    attention_mask[0, 0] = 0
+    router_padding_mask = torch.zeros((batch, seq_len), dtype=torch.bool)
+    router_padding_mask[1, -1] = True
+
+    def run(routes):
+        layout = build_token_metadata_layout(
+            attention_mask,
+            routes.device,
+            packed=packed,
+            fp8_enabled=False,
+        )
+        replay_utils.setup_per_microbatch_replay_forward(
+            _pack_routes(routes, attention_mask),
+            router_padding_mask,
+            attention_mask,
+            model=object(),
+            model_config=SimpleNamespace(fp8=None, sequence_parallel=False),
+            metadata_layout=layout,
+            remove_microbatch_padding=packed,
+        )
+        return [router.target_topk_idx.clone() for router in routers]
+
+    from_int16 = run(routes_int16)
+    from_int32 = run(routes_int32)
+
+    assert len(from_int16) == len(from_int32) == 2
+    for narrow, wide in zip(from_int16, from_int32, strict=True):
+        assert narrow.dtype == wide.dtype == torch.int32
+        assert torch.equal(narrow, wide)
+
+
+@pytest.mark.parametrize(
+    ("model_kind", "pre_process", "expected"),
+    [
+        ("gpt", True, [[False, False, True, True]]),
+        ("gpt", False, [[True, True]]),
+        ("hybrid", True, [[True, True]]),
+    ],
+)
+def test_sequence_parallel_mask_layout(monkeypatch, model_kind, pre_process, expected):
+    hybrid_model = types.ModuleType("megatron.core.models.hybrid.hybrid_model")
+    tensor_parallel = types.ModuleType("megatron.core.tensor_parallel")
+    utils = types.ModuleType("megatron.core.utils")
+
+    class HybridModel:
+        def __init__(self):
+            self.pre_process = pre_process
+
+    class GPTModel:
+        def __init__(self):
+            self.pre_process = pre_process
+
+    hybrid_model.HybridModel = HybridModel
+    tensor_parallel.scatter_to_sequence_parallel_region = lambda value: value.chunk(2, dim=0)[1]
+    utils.unwrap_model = lambda model: model
+    monkeypatch.setitem(sys.modules, "megatron.core.models.hybrid.hybrid_model", hybrid_model)
+    monkeypatch.setitem(sys.modules, "megatron.core.tensor_parallel", tensor_parallel)
+    monkeypatch.setitem(sys.modules, "megatron.core.utils", utils)
+
+    mask = torch.tensor([[0, 0, 1, 1]], dtype=torch.bool)
+    model = HybridModel() if model_kind == "hybrid" else GPTModel()
+    scattered = replay_utils.scatter_router_padding_mask_for_model(
+        mask,
+        model,
+        SimpleNamespace(sequence_parallel=True),
+    )
+
+    assert scattered.tolist() == expected
+
+
+@pytest.fixture
+def router_replay_module(monkeypatch):
+    module = types.ModuleType("megatron.core.transformer.moe.router_replay")
+    router = SimpleNamespace(replay_backward_list=[], action=None)
+
+    class RouterReplay:
+        global_router_replay_instances = [router]
+
+        @classmethod
+        def clear_global_indices(cls):
+            for instance in cls.global_router_replay_instances:
+                instance.replay_backward_list = []
+
+        @classmethod
+        def clear_global_router_replay_action(cls):
+            for instance in cls.global_router_replay_instances:
+                instance.action = None
+
+    module.RouterReplay = RouterReplay
+    monkeypatch.setitem(sys.modules, "megatron.core.transformer.moe.router_replay", module)
+    return router
+
+
+def test_router_replay_schedule_clears_stale_forward_only_fifo(router_replay_module):
+    router_replay_module.replay_backward_list = ["stale-forward-only"]
+
+    with replay_utils.router_replay_schedule(enabled=True):
+        assert router_replay_module.replay_backward_list == []
+        router_replay_module.replay_backward_list.extend(["microbatch-0", "microbatch-1"])
+        assert router_replay_module.replay_backward_list.pop(0) == "microbatch-0"
+        assert router_replay_module.replay_backward_list.pop(0) == "microbatch-1"
+
+    assert router_replay_module.replay_backward_list == []
+    assert router_replay_module.action is None
+
+
+def test_router_replay_schedule_clears_after_exception(router_replay_module):
+    with pytest.raises(RuntimeError, match="schedule failed"):
+        with replay_utils.router_replay_schedule(enabled=True):
+            router_replay_module.replay_backward_list.append("partially-consumed-schedule")
+            router_replay_module.action = "replay-backward"
+            raise RuntimeError("schedule failed")
+
+    assert router_replay_module.replay_backward_list == []
+    assert router_replay_module.action is None
+
+
+# DeepSeek-V4 as the pinned Megatron-Bridge builds it: 43 blocks of (W/C/H attention, MoE) -> 86 hybrid layers.
+_DSV4_PATTERN = "WEWE" + "CEHE" * 20 + "CE"
+# GLM-5.x as the pinned Megatron-Bridge builds it: 3 dense blocks then 75 (DSA attention, MoE) -> 156 hybrid layers.
+_GLM5_PATTERN = "D-" * 3 + "DE" * 75
+
+
+@pytest.mark.parametrize(
+    "pattern, num_layers, hybrid, expected",
+    [
+        # DeepSeek-V4: MoE routers on every odd hybrid layer.
+        (_DSV4_PATTERN, 43, list(range(1, 86, 2)), list(range(43))),
+        # Under pipeline parallelism each stage maps only its own routers: stage 0's (1, ..., 41) all fit below the
+        # 43 decoder layers and must still be mapped; stage 1's overflow them.
+        (_DSV4_PATTERN, 43, list(range(1, 43, 2)), list(range(21))),
+        (_DSV4_PATTERN, 43, list(range(43, 86, 2)), list(range(21, 43))),
+        # GLM-5.x: MoE routers at hybrid 7, 9, ..., 155 -> decoder layers 3..77 (out of range unmapped at PP=1),
+        # and a PP stage-0 slice, which fits below 78 unmapped and would silently replay the wrong layers.
+        (_GLM5_PATTERN, 78, list(range(7, 156, 2)), list(range(3, 78))),
+        (_GLM5_PATTERN, 78, list(range(7, 78, 2)), list(range(3, 39))),
+        # Beam: decoder layer = attention + MLP/MoE pair; MoE routers at hybrid 7, 9, 11.
+        ("*-*-*-*E*E*E", 6, [7, 9, 11], [3, 4, 5]),
+        # Pipeline separators and MTP suffixes are ignored.
+        ("*-*-*-|*E*E*E/*E", 6, [7, 9, 11], [3, 4, 5]),
+        # Nemotron-H style: one decoder layer per hybrid layer, no remapping.
+        ("MEM*E", 5, [1, 4], [1, 4]),
+    ],
+)
+def test_hybrid_router_layers_map_to_decoder_layers(pattern, num_layers, hybrid, expected):
+    config = SimpleNamespace(hybrid_layer_pattern=pattern)
+    assert replay_utils._hybrid_to_decoder_layer_indices(config, num_layers, hybrid) == expected
+    # GPTModel configs have no hybrid pattern.
+    assert replay_utils._hybrid_to_decoder_layer_indices(SimpleNamespace(), num_layers, hybrid) == hybrid

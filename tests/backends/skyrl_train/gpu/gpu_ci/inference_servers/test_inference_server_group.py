@@ -36,11 +36,13 @@ def make_vllm_cli_args(
     load_format: str = "auto",
 ) -> argparse.Namespace:
     """Create CLI args for vLLM server using official parser."""
-    from vllm.entrypoints.openai.cli_args import make_arg_parser
+    from vllm import AsyncEngineArgs
+    from vllm.entrypoints.common.cli_args import FrontendArgs
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 
     parser = FlexibleArgumentParser(description="vLLM server")
-    parser = make_arg_parser(parser)
+    parser = FrontendArgs.add_cli_args(parser)
+    parser = AsyncEngineArgs.add_cli_args(parser)
     return parser.parse_args(
         [
             "--model",
@@ -118,7 +120,9 @@ def server_group_and_router(class_scoped_ray_init_fixture):
         "client": client,
     }
 
-    asyncio.get_event_loop().run_until_complete(client.teardown())
+    # Teardown runs after the class-scoped event loop is gone, so create a
+    # fresh one. `asyncio.get_event_loop()` raises on py3.12 when no loop is set.
+    asyncio.run(client.teardown())
     router.shutdown()
     group.shutdown()
 

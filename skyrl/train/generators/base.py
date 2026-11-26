@@ -4,9 +4,13 @@ from typing import Any, Dict, List, Literal, Optional, TypedDict, Union
 
 import torch
 
-from skyrl.backends.skyrl_train.inference_engines.base import ConversationType
+from skyrl.backends.skyrl_train.inference_servers.base import ConversationType
+from skyrl.backends.skyrl_train.utils.routed_experts import RoutedExpertIndices
+from skyrl.backends.skyrl_train.utils.sample_support import CompactSampleSupport
 
 TrainingPhase = Literal["train", "eval"]
+TRAINING_PHASE_TRAIN: TrainingPhase = "train"
+TRAINING_PHASE_EVAL: TrainingPhase = "eval"
 
 
 @dataclass
@@ -42,7 +46,18 @@ class GeneratorOutput(TypedDict):
     rollout_metrics: Optional[Dict[str, Any]]
     rollout_logprobs: Optional[List[List[float]]]
     trajectory_ids: Optional[List[TrajectoryID]]
-    rollout_expert_indices: Optional[List[List[List[List[int]]]]]  # [batch_size, seq_len, layer_num, topk]
+    # Wall-clock generation time (seconds) for each trajectory, with one entry per
+    # trajectory in the input batch (i.e. per ``agent_loop`` call). Used by the fully
+    # async trainer to compute per-group / intra-group completion-time metrics.
+    trajectory_generation_times: Optional[List[float]]
+    # Engine and env time splits of ``trajectory_generation_times``, one list entry per trajectory,
+    # e.g. {"llm": [...], "env": [...]}. trajectory_time_splits is None if any trajectory did not
+    # record its split.
+    trajectory_time_splits: Optional[Dict[str, List[float]]]
+    # Per trajectory, routes for a prefix of its prompt and response tokens.
+    rollout_expert_indices: Optional[List[RoutedExpertIndices]]
+    # Per trajectory, CSR sampler support for each response token; uncaptured rows are empty.
+    rollout_sample_support: Optional[List[CompactSampleSupport]]
     # Applicable only for step-wise training
     is_last_step: Optional[List[bool]]
     # Per-row env metrics (one dict per row in the flattened batch). Used by

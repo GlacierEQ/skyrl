@@ -18,10 +18,10 @@ uv run --isolated --extra megatron --python 3.12 \
     python -m skyrl.train.main_sft \
     strategy=megatron \
     model.path=Qwen/Qwen2.5-1.5B-Instruct \
-    dataset_name="$DATA_DIR" \
-    dataset_split="train[:4000]" \
-    eval_dataset_name="$DATA_DIR" \
-    eval_dataset_split="train[4000:]" \
+    train_datasets="['$DATA_DIR']" \
+    train_dataset_splits="['train[:4000]']" \
+    eval_datasets="['$DATA_DIR']" \
+    eval_dataset_splits="['train[4000:]']" \
     messages_key=messages \
     tools_key=tools \
     system_key=system \
@@ -29,7 +29,7 @@ uv run --isolated --extra megatron --python 3.12 \
     num_steps=50 \
     batch_size=8 \
     micro_train_batch_size_per_gpu=2 \
-    use_sample_packing=true \
+    remove_microbatch_padding=true \
     seed=42 \
     optimizer_config.lr=1e-6 \
     optimizer_config.weight_decay=1e-2 \

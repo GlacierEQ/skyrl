@@ -4,14 +4,23 @@ Common utilities for inference servers.
 Uses Ray's public network utilities for consistency with Ray's cluster management.
 """
 
+import ipaddress
 import logging
+import os
 import socket
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Optional, Tuple
 
 import ray
 
 logger = logging.getLogger(__name__)
+
+# The base port for the vLLM server group. This is the lowest port number SkyRL
+# assigns vLLM servers that are launched. Each server actor owns a 100-port window
+# (`SERVER_PORT_STRIDE`). Overridable because another service on the host
+# (e.g. a k8s LoadBalancer) can claim port 8000 and silently hijack /wake_up,
+# which then 404s from the other app.
+VLLM_START_PORT = int(os.environ.get("SKYRL_VLLM_START_PORT", 8000))
 
 # Stride between successive server actors' (or groups') start_port values.
 # Each actor's `find_and_reserve_port` increments by 1 on conflict, so this
@@ -26,10 +35,36 @@ class ServerInfo:
 
     ip: str
     port: int
+    # optional, in case the mooncake connector is being used
+    mooncake_bootstrap_server_port: Optional[int] = None
 
     @property
     def url(self) -> str:
-        return f"http://{self.ip}:{self.port}"
+        return format_http_url(self.ip, self.port)
+
+
+def is_ipv6_address(host: str) -> bool:
+    """True if ``host`` is a literal IPv6 address (hostnames and IPv4 return False)."""
+    try:
+        return isinstance(ipaddress.ip_address(host), ipaddress.IPv6Address)
+    except ValueError:
+        return False
+
+
+def format_http_url(host: str, port: int, path: str = "") -> str:
+    """Build ``http://host:port/path`` with IPv6 literals bracketed (RFC 3986).
+
+    On IPv6-only clusters ``ray.util.get_node_ip_address()`` returns a bare IPv6
+    literal; ``f"http://{ip}:{port}"`` then yields e.g. ``http://2602:fb33::5:8100``
+    which URL parsers reject (``Invalid port``).
+    """
+    host_part = f"[{host}]" if is_ipv6_address(host) else host
+    return f"http://{host_part}:{port}{path}"
+
+
+def default_bind_host(node_ip: str) -> str:
+    """Wildcard bind address matching the node's address family (``::`` accepts IPv4 too)."""
+    return "::" if is_ipv6_address(node_ip) else "0.0.0.0"
 
 
 def get_node_ip() -> str:

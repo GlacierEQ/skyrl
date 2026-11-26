@@ -3,7 +3,8 @@
 # https://github.com/OpenRLHF/OpenRLHF/blob/main/openrlhf/models/actor.py
 # https://github.com/OpenRLHF/OpenRLHF/blob/main/openrlhf/models/model.py
 
-from typing import Any, Dict, Optional, Union
+from dataclasses import dataclass
+from typing import Optional, Union
 
 import numpy as np
 import torch
@@ -22,15 +23,86 @@ from transformers import (
     BitsAndBytesConfig,
 )
 
+from skyrl.backends.skyrl_train.distributed.megatron.token_metadata import (
+    canonical_token_metadata_layout,
+)
 from skyrl.backends.skyrl_train.distributed.ulysses.utils import (
     gather_outputs_and_unpad,
     ulysses_pad_and_slice_inputs,
 )
 from skyrl.backends.skyrl_train.training_batch import TensorList
+from skyrl.backends.skyrl_train.utils.lora_targets import (
+    resolve_critic_lora_target_modules,
+    resolve_lora_target_modules,
+)
+from skyrl.backends.skyrl_train.utils.off_policy_correction_utils import MemberWeight
+from skyrl.backends.skyrl_train.utils.sample_support import (
+    SAMPLE_SUPPORT_NO_ROW,
+    SCORE_CENTERING_SCORES_KEY,
+    PackedSampleSupport,
+)
+from skyrl.backends.skyrl_train.utils.sample_support_replay import (
+    SampleSupportScores,
+    missing_sample_support_message,
+    sample_support_row_ids_in_batch_positions,
+    score_aligned_sample_support,
+)
 from skyrl.backends.skyrl_train.utils.torch_utils import (
     chunked_entropy_from_logits,
     logprobs_from_logits,
 )
+
+
+@dataclass(frozen=True)
+class _SampleSupportChannels:
+    """Token-aligned metadata transformed alongside model inputs."""
+
+    row_ids: torch.Tensor
+    loss_mask: torch.Tensor
+
+    @classmethod
+    def build(
+        cls,
+        sequences: torch.Tensor,
+        attention_mask: torch.Tensor,
+        sample_support: PackedSampleSupport,
+        loss_mask: torch.Tensor,
+    ) -> "_SampleSupportChannels":
+        """Place channels in canonical ``[batch, seq_len]`` positions."""
+        layout = canonical_token_metadata_layout(attention_mask)
+        target_loss_mask = torch.zeros_like(sequences, dtype=torch.bool)
+        target_loss_mask[:, sequences.shape[1] - loss_mask.shape[1] :] = loss_mask.to(torch.bool)
+        return cls(
+            row_ids=sample_support_row_ids_in_batch_positions(sample_support, layout),
+            loss_mask=target_loss_mask,
+        )
+
+    def unpad(self, nnz_indices: torch.Tensor) -> "_SampleSupportChannels":
+        """Drop padding positions exactly as ``unpad_input`` does for the tokens."""
+
+        def gather(channel: torch.Tensor) -> torch.Tensor:
+            return channel.reshape(-1).index_select(0, nnz_indices).unsqueeze(0)
+
+        return _SampleSupportChannels(
+            row_ids=gather(self.row_ids),
+            loss_mask=gather(self.loss_mask),
+        )
+
+    def roll_to_logit_positions(self) -> "_SampleSupportChannels":
+        """Shift the loss mask onto the logit that predicts each token, like ``sequences_rolled``."""
+        return _SampleSupportChannels(
+            row_ids=self.row_ids,
+            loss_mask=torch.roll(self.loss_mask, shifts=-1, dims=1),
+        )
+
+    def slice_for_sequence_parallel(self, sp_size: int) -> "_SampleSupportChannels":
+        """Take this rank's Ulysses shard, padding row ids with their sentinel."""
+        return _SampleSupportChannels(
+            row_ids=ulysses_pad_and_slice_inputs(
+                self.row_ids, sp_size=sp_size, input_padding_value=SAMPLE_SUPPORT_NO_ROW
+            )[0],
+            loss_mask=ulysses_pad_and_slice_inputs(self.loss_mask, sp_size=sp_size)[0],
+        )
 
 
 class HFModelWrapper(nn.Module):
@@ -69,14 +141,14 @@ class HFModelWrapper(nn.Module):
         lora_init_method="kaiming",
         target_modules=None,
         exclude_modules=None,
+        train_attn=True,
+        train_mlp=True,
         device_map=None,
         temperature=1.0,
         use_liger_kernel=False,
         sequence_parallel_size=1,
-        use_sample_packing: bool = False,
+        remove_microbatch_padding: bool = False,
         use_torch_compile: bool = False,
-        rope_scaling: Dict[str, Any] = {},
-        rope_theta: float | None = None,
         model_config_kwargs: dict = {},
         meta_init: bool = False,
         language_model_only: bool = False,
@@ -87,12 +159,12 @@ class HFModelWrapper(nn.Module):
         self.temperature = temperature
         self.sequence_parallel_size = sequence_parallel_size
         self.attn_implementation = "flash_attention_2" if use_flash_attention_2 else "sdpa"
-        self.use_sample_packing = use_sample_packing
+        self.remove_microbatch_padding = remove_microbatch_padding
         self.is_vlm = False
-        if use_sample_packing:
+        if remove_microbatch_padding:
             assert (
                 self.attn_implementation == "flash_attention_2"
-            ), "Flash attention 2 should be used for `use_sample_packing`"
+            ), "Flash attention 2 should be used for `remove_microbatch_padding`"
 
         if isinstance(pretrain_or_model, str):
             if load_in_4bit:
@@ -129,16 +201,27 @@ class HFModelWrapper(nn.Module):
                     # NOTE: In future transformers releases (> 5.0.0), all multimodal models can use AutoModelForMultimodalLM.
                     model_class = AutoModelForImageTextToText
 
-            if rope_scaling:
-                model_config.rope_scaling = rope_scaling
-            if rope_theta:
-                model_config.rope_theta = rope_theta
             model_config._attn_implementation = self.attn_implementation
 
             if meta_init:
                 with torch.device("meta"):
                     self.model = model_class.from_config(model_config, trust_remote_code=True)
-                self.model.to(torch.bfloat16 if bf16 else torch.float32)
+                target_dtype = torch.bfloat16 if bf16 else torch.float32
+                # Cast just params + persistent buffers to the target dtype;
+                # leave non-persistent buffers at their init dtype. For example, transformers
+                # builds `Qwen3RotaryEmbedding.inv_freq` via a RoPE init that hardcodes
+                # `dtype=torch.float`, so it is fp32 no matter the model dtype, which rank-0's
+                # `from_pretrained` preserves but a blanket `.to` would clobber.
+                # SEE: https://github.com/huggingface/transformers/blob/v5.8.0/src/transformers/modeling_rope_utils.py#L177-L178
+                # Otherwise, e.g., non-rank-0's `inv_freq` is bf16 while rank-0's stays fp32,
+                # so the init-time rank-0→all broadcast that seeds these buffers copies
+                # rank-0's fp32 bytes into that half-width bf16 buffer as huge garbage values
+                non_persistent_names = {n for n, _ in self.model.named_non_persistent_buffers()}
+                for p in self.model.parameters():
+                    p.data = p.data.to(target_dtype)
+                for name, buf in self.model.named_buffers():
+                    if name not in non_persistent_names:
+                        buf.data = buf.data.to(target_dtype)
             else:
                 self.model = model_class.from_pretrained(
                     pretrain_or_model,
@@ -177,11 +260,12 @@ class HFModelWrapper(nn.Module):
             if lora_rank > 0:
                 # https://github.com/huggingface/peft/issues/137
                 self.model.enable_input_require_grads()
+                resolved_target_modules = resolve_lora_target_modules(self.model, target_modules, train_attn, train_mlp)
                 lora_config = LoraConfig(
                     task_type=TaskType.CAUSAL_LM,
                     r=lora_rank,
                     lora_alpha=lora_alpha,
-                    target_modules=target_modules,
+                    target_modules=resolved_target_modules,
                     exclude_modules=exclude_modules,
                     lora_dropout=lora_dropout,
                     bias="none",
@@ -241,14 +325,33 @@ class HFModelWrapper(nn.Module):
         pixel_values: Optional[TensorList] = None,
         image_grid_thw: Optional[TensorList] = None,
         mm_token_type_ids: Optional[torch.Tensor] = None,
+        sample_support: Optional[PackedSampleSupport] = None,
+        loss_mask: Optional[torch.Tensor] = None,
+        enable_sample_support_replay: bool = False,
+        centering_weight: Optional[MemberWeight] = None,
     ) -> torch.Tensor:
-        """Returns action log probs"""
+        """Returns action log probs.
+
+        With ``centering_weight`` (sample-support replay only), ``output`` also holds the
+        canonical-position ``SampleSupportScores`` under ``SCORE_CENTERING_SCORES_KEY``.
+        """
         has_image_inputs = pixel_values is not None or image_grid_thw is not None
+        support_channels = None
+        if centering_weight is not None and not enable_sample_support_replay:
+            raise ValueError("score centering requires sample-support replay")
+        if enable_sample_support_replay:
+            if sample_support is None:
+                raise ValueError(missing_sample_support_message("FSDP"))
+            if loss_mask is None:
+                raise ValueError("sample-support replay is enabled but the microbatch has no loss mask")
+            support_channels = _SampleSupportChannels.build(sequences, attention_mask, sample_support, loss_mask)
         if self.is_vlm:
             # VLMs use model specific 3D positional IDs, meaning sequence packing can not be supported.
             # Sequence packing requires computing position IDs, but position IDs for VLMs are 3D and require
             # model specific logic to compute.
-            assert not self.use_sample_packing, "Sample packing is not supported with VLM vision inputs"
+            assert (
+                not self.remove_microbatch_padding
+            ), "remove_microbatch_padding is not supported with VLM vision inputs"
             assert self.sequence_parallel_size == 1, "Sequence parallelism is not supported with VLM vision inputs"
 
             if has_image_inputs:
@@ -264,7 +367,7 @@ class HFModelWrapper(nn.Module):
         sequences_fwd = sequences
         position_ids_fwd = position_ids
         attention_mask_fwd = attention_mask
-        if self.use_sample_packing:
+        if self.remove_microbatch_padding:
             with torch.no_grad():
                 # Removes padding to get a packed tensor. `unpad_input` expects 3 dimensional tensor so we unsqueeze first
                 sequences_fwd, nnz_indices, _, _, _ = unpad_input(
@@ -275,12 +378,16 @@ class HFModelWrapper(nn.Module):
                 position_ids_fwd, _, _, _, _ = unpad_input(position_ids.unsqueeze(-1), attention_mask)
                 # (nnz, 1) -> (1, nnz)
                 position_ids_fwd = position_ids_fwd.transpose(0, 1)
+                if support_channels is not None:
+                    support_channels = support_channels.unpad(nnz_indices)
                 attention_mask_fwd = None  # no attention mask with FA 2
 
         sequences_rolled = torch.roll(sequences_fwd, shifts=-1, dims=1)
+        if support_channels is not None:
+            support_channels = support_channels.roll_to_logit_positions()
         if self.sequence_parallel_size > 1:
             # NOTE: don't pass any attn mask with sample packing
-            attention_mask_fwd = None if self.use_sample_packing else attention_mask_fwd
+            attention_mask_fwd = None if self.remove_microbatch_padding else attention_mask_fwd
 
             # slice for sequence parallelism
             # (bsz, seqlen) -> (bsz, seqlen//sp_size)
@@ -290,6 +397,8 @@ class HFModelWrapper(nn.Module):
             sequences_rolled, _, _, _ = ulysses_pad_and_slice_inputs(
                 sequences_rolled, None, None, self.sequence_parallel_size
             )
+            if support_channels is not None:
+                support_channels = support_channels.slice_for_sequence_parallel(self.sequence_parallel_size)
 
         if self.is_vlm:
             # NOTE: transformers v5 introduced `mm_token_type_ids` to distinguish text
@@ -312,7 +421,7 @@ class HFModelWrapper(nn.Module):
                 **vlm_kwargs,
             )
         # NOTE (sumanthrh): Once we have position_ids, we don't need attention mask with flash attention.
-        elif self.use_sample_packing and self.attn_implementation == "flash_attention_2":
+        elif self.remove_microbatch_padding and self.attn_implementation == "flash_attention_2":
             # NOTE (sumanthrh): Don't use attention mask. position_ids is enough.
             # Not using attention mask leads to higher perf since flash attention varlen func is enabled
             output = self.model(sequences_fwd, attention_mask=None, position_ids=position_ids_fwd)
@@ -322,57 +431,76 @@ class HFModelWrapper(nn.Module):
         logits_BSV = output["logits"]
         logits_BSV.div_(temperature)
 
-        # NOTE: this is slightly inaccurate with sample packing because last token from nth seq -> first token of n+1th seq loss is added.
-        log_probs = logprobs_from_logits(
-            logits_BSV,
-            sequences_rolled,
-            inplace_backward=True,
-        )
-
-        # gather output if sp > 1
-        if self.sequence_parallel_size > 1:
-            dim = log_probs.ndim - 1
-            log_probs = gather_outputs_and_unpad(
-                log_probs, gather_dim=dim, unpad_dim=dim, padding_size=pad_size
-            )  # shape can be (1, nnz) - with packing or (B, S) - without packing
-
-        if self.use_sample_packing:
-            # add padding back - postprocess logprobs to be compatible with original tensor
-            batch_size, seqlen = attention_mask.shape
-            # (1, nnz-1) -> (batch_size, seqlen). Pad token ID used by flash attention is 0.
-            log_probs = pad_input(
-                log_probs.transpose(0, 1), indices=nnz_indices, batch=batch_size, seqlen=seqlen
-            ).squeeze(-1)
-
-        if compute_entropy:
-            # For sample packing: entropy is calculated on unpacked data, so no attention mask needed
-            # For non-sample packing: pass the attention mask to exclude padding tokens
-            entropy_mask = None
-            if not self.use_sample_packing:
-                # Non-sample packing: pass attention mask to handle padding
-                # Use attention_mask_fwd which may be sliced (if sequence_parallel_size > 1) or full
-                entropy_mask = attention_mask_fwd
-
-            entropy_BS = self.chunked_entropy_from_logits_fn(
+        support_entropy = None
+        if support_channels is not None:
+            # FSDP supplies unsharded, temperature-scaled logits.
+            support_scores = score_aligned_sample_support(
                 logits_BSV,
-                requires_grad=entropy_requires_grad,
-                attention_mask=entropy_mask,
-                chunk_size=self.logprobs_chunk_size,
+                sequences_rolled,
+                support_channels.row_ids,
+                support_channels.loss_mask,
+                sample_support,
+                vocab_start_index=0,
+                vocab_end_index=logits_BSV.shape[-1],
+                tp_group=None,
+                compute_entropy=compute_entropy,
+                entropy_requires_grad=compute_entropy and entropy_requires_grad,
+                centering_weight=centering_weight,
+            )
+            log_probs = support_scores.logprobs
+            support_entropy = support_scores.entropy
+        else:
+            # NOTE: this is slightly inaccurate with sample packing because last token from nth seq -> first token of n+1th seq loss is added.
+            log_probs = logprobs_from_logits(
+                logits_BSV,
+                sequences_rolled,
+                inplace_backward=True,
             )
 
-            if self.sequence_parallel_size > 1:
-                dim = entropy_BS.ndim - 1
-                entropy_BS = gather_outputs_and_unpad(
-                    entropy_BS, gather_dim=dim, unpad_dim=dim, padding_size=pad_size
-                )  # shape can be (1, nnz) - with packing or (B,S) - without packing
-            if self.use_sample_packing:
-                entropy_BS = pad_input(
-                    entropy_BS.transpose(0, 1), indices=nnz_indices, batch=batch_size, seqlen=seqlen
-                ).squeeze(
-                    -1
-                )  # (1, nnz) -> (B, S)
+        batch_size, seqlen = attention_mask.shape
 
-            output["entropy"] = entropy_BS
+        def to_canonical_batch_positions(values: torch.Tensor) -> torch.Tensor:
+            """Undo the Ulysses slice and microbatch unpadding."""
+            if self.sequence_parallel_size > 1:
+                dim = values.ndim - 1
+                values = gather_outputs_and_unpad(values, gather_dim=dim, unpad_dim=dim, padding_size=pad_size)
+            if self.remove_microbatch_padding:
+                values = pad_input(
+                    values.transpose(0, 1), indices=nnz_indices, batch=batch_size, seqlen=seqlen
+                ).squeeze(-1)
+            return values
+
+        log_probs = to_canonical_batch_positions(log_probs)
+        if centering_weight is not None:
+            output[SCORE_CENTERING_SCORES_KEY] = SampleSupportScores(
+                logprobs=log_probs,
+                entropy=None,
+                # Carry the mask through float-only gather and unpadding operations.
+                valid_mask=to_canonical_batch_positions(support_scores.valid_mask.to(log_probs.dtype)) > 0,
+                centering_term=to_canonical_batch_positions(support_scores.centering_term),
+                centering_term_negative=(
+                    None
+                    if support_scores.centering_term_negative is None
+                    else to_canonical_batch_positions(support_scores.centering_term_negative)
+                ),
+                sampler_logprobs=to_canonical_batch_positions(support_scores.sampler_logprobs),
+                support_tv=to_canonical_batch_positions(support_scores.support_tv),
+                sampler_mass=to_canonical_batch_positions(support_scores.sampler_mass),
+            )
+
+        if compute_entropy:
+            if support_entropy is not None:
+                output["entropy"] = to_canonical_batch_positions(support_entropy)
+            else:
+                padding_mask = None if self.remove_microbatch_padding else attention_mask_fwd
+                output["entropy"] = to_canonical_batch_positions(
+                    self.chunked_entropy_from_logits_fn(
+                        logits_BSV,
+                        requires_grad=entropy_requires_grad,
+                        attention_mask=padding_mask,
+                        chunk_size=self.logprobs_chunk_size,
+                    )
+                )
 
         if isinstance(num_actions, list):
             if len(num_actions) == 1:
@@ -398,7 +526,7 @@ def _get_critic_model(
     base_llm_model,
     value_head_prefix="value_head",
     sequence_parallel_size=1,
-    use_sample_packing: bool = False,
+    remove_microbatch_padding: bool = False,
 ):
     class CriticModel(base_pretrained_model):
         supports_gradient_checkpointing = True
@@ -411,11 +539,11 @@ def _get_critic_model(
             setattr(self, value_head_prefix, nn.Linear(config.hidden_size, 1, bias=False))
 
             self.sequence_parallel_size = sequence_parallel_size
-            self.use_sample_packing = use_sample_packing
-            if use_sample_packing:
+            self.remove_microbatch_padding = remove_microbatch_padding
+            if remove_microbatch_padding:
                 assert (
                     config._attn_implementation == "flash_attention_2"
-                ), "Flash attention must be used with sample packing"
+                ), "Flash attention must be used with remove_microbatch_padding"
 
             if self.sequence_parallel_size > 1:
                 logger.info("Critic model using sequence parallelism with size: ", self.sequence_parallel_size)
@@ -435,7 +563,7 @@ def _get_critic_model(
             position_ids_fwd = position_ids
             attention_mask_fwd = attention_mask
 
-            if self.use_sample_packing:
+            if self.remove_microbatch_padding:
                 with torch.no_grad():
                     # remove padding. `unpad_input` expects 3 dimensional tensor
                     input_ids_fwd, nnz_indices, _, _, _ = unpad_input(
@@ -452,7 +580,7 @@ def _get_critic_model(
                     attention_mask_fwd = None
 
             if self.sequence_parallel_size > 1:
-                assert self.use_sample_packing, "sample packing must be true for sequence parallelism"
+                assert self.remove_microbatch_padding, "remove_microbatch_padding must be true for sequence parallelism"
                 # don't pass any attention mask for flash attention 2. this will save an all gather.
                 attention_mask_fwd = None if self.config._attn_implementation == "flash_attention_2" else attention_mask
                 # slice for sequence parallelism
@@ -479,7 +607,7 @@ def _get_critic_model(
 
             values_BSH = getattr(self, self.value_head_prefix)(last_hidden_states_BSH)
 
-            if self.use_sample_packing:
+            if self.remove_microbatch_padding:
                 # add padding back - postprocess logits to be compatible with original tensors
                 batch_size, seqlen = attention_mask.shape
                 # (1, nnz, 1) -> (nnz, 1) -> (batch_size, seqlen, 1)
@@ -514,12 +642,14 @@ def get_llm_for_sequence_regression(
     target_modules=None,
     exclude_modules=None,
     lora_dropout=0,
+    train_attn: bool = True,
+    train_mlp: bool = True,
     use_flash_attention_2=False,
     init_value_head: bool = False,
     value_head_prefix="value_head",
     device_map=None,
     sequence_parallel_size=1,
-    use_sample_packing: bool = False,
+    remove_microbatch_padding: bool = False,
     model_config_kwargs: dict = {},
     meta_init: bool = False,
     **kwargs,
@@ -547,7 +677,7 @@ def get_llm_for_sequence_regression(
         base_class,
         value_head_prefix,
         sequence_parallel_size=sequence_parallel_size,
-        use_sample_packing=use_sample_packing,
+        remove_microbatch_padding=remove_microbatch_padding,
     )
 
     if load_in_4bit:
@@ -581,10 +711,11 @@ def get_llm_for_sequence_regression(
     # LoRA
     if lora_rank > 0:
         model.enable_input_require_grads()
+        targets = resolve_critic_lora_target_modules(model, target_modules, train_attn, train_mlp, value_head_prefix)
         lora_config = LoraConfig(
             r=lora_rank,
             lora_alpha=lora_alpha,
-            target_modules=target_modules,
+            target_modules=targets,
             exclude_modules=exclude_modules,
             lora_dropout=lora_dropout,
             bias="none",

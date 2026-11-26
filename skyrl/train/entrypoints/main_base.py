@@ -12,23 +12,17 @@ from typing import Optional
 import ray
 from loguru import logger
 from ray.util.placement_group import placement_group
-from transformers import PreTrainedTokenizerBase
 
-from skyrl.backends.skyrl_train.inference_engines.base import InferenceEngineInterface
-from skyrl.backends.skyrl_train.inference_engines.inference_engine_client import (
-    InferenceEngineClient,
-)
-from skyrl.backends.skyrl_train.inference_engines.remote_inference_engine import (
-    create_remote_inference_engines,
-)
+from skyrl.backends.skyrl_train.inference_servers.base import InferenceEngineInterface
 from skyrl.backends.skyrl_train.inference_servers.utils import resolve_policy_model_name
-from skyrl.env_vars import _SKYRL_USE_NEW_INFERENCE, SKYRL_RAY_PG_TIMEOUT_IN_S
+from skyrl.env_vars import SKYRL_RAY_PG_TIMEOUT_IN_S
 from skyrl.train.config import SkyRLTrainConfig, get_config_as_yaml_str
 from skyrl.train.dataset import PromptDataset
 from skyrl.train.generators.base import GeneratorInterface
 from skyrl.train.trainer import RayPPOTrainer
 from skyrl.train.utils import validate_cfg
 from skyrl.train.utils.tracking import Tracking
+from skyrl.train.utils.trajectory_logging import TrajectoryLogger
 from skyrl.train.utils.utils import (
     ResolvedPlacementGroup,
     get_ray_pg_ready_with_timeout,
@@ -44,90 +38,6 @@ mp.set_start_method("spawn", force=True)
 
 config_dir = str(Path(__file__).parent.parent / "config")
 __all__ = ["BasePPOExp", "config_dir"]
-
-
-def create_ray_wrapped_inference_engines_from_config(
-    cfg: SkyRLTrainConfig,
-    colocate_pg: Optional[ResolvedPlacementGroup],
-    tokenizer: PreTrainedTokenizerBase,
-):
-    from skyrl.backends.skyrl_train.inference_engines.ray_wrapped_inference_engine import (
-        create_ray_wrapped_inference_engines,
-    )
-
-    ie_cfg = cfg.generator.inference_engine
-    engine_kwargs = {
-        "num_inference_engines": ie_cfg.num_engines,
-        "tensor_parallel_size": ie_cfg.tensor_parallel_size,
-        "pipeline_parallel_size": ie_cfg.pipeline_parallel_size,
-        "model_dtype": ie_cfg.model_dtype,
-        "pretrain": cfg.trainer.policy.model.path,
-        "seed": cfg.trainer.seed,
-        "vllm_v1_disable_multiproc": ie_cfg.vllm_v1_disable_multiproc,
-        "enable_prefix_caching": ie_cfg.enable_prefix_caching,
-        "enforce_eager": ie_cfg.enforce_eager,
-        "expert_parallel_size": ie_cfg.expert_parallel_size,
-        "data_parallel_size": ie_cfg.data_parallel_size,
-        "shared_pg": colocate_pg,
-        "gpu_memory_utilization": ie_cfg.gpu_memory_utilization,
-        "inference_engine_enable_sleep": cfg.trainer.placement.colocate_all,
-        "async_engine": ie_cfg.async_engine,
-        "max_num_batched_tokens": ie_cfg.max_num_batched_tokens,
-        "max_num_seqs": ie_cfg.max_num_seqs,
-        "tokenizer": tokenizer,
-        "backend": ie_cfg.backend,
-        "language_model_only": ie_cfg.language_model_only,
-        "engine_init_kwargs": ie_cfg.engine_init_kwargs,
-        "enable_ray_prometheus_stats": ie_cfg.enable_ray_prometheus_stats,
-        "enable_return_routed_experts": ie_cfg.enable_return_routed_experts,
-        "distributed_executor_backend": ie_cfg.distributed_executor_backend,
-    }
-
-    # Conditionally add LoRA parameters if LoRA is enabled
-    if cfg.trainer.policy.model.lora.rank > 0 and cfg.trainer.strategy != "megatron":
-        lora_cfg = cfg.trainer.policy.model.lora
-        engine_kwargs["enable_lora"] = True
-        engine_kwargs["max_lora_rank"] = lora_cfg.rank
-        engine_kwargs["sleep_level"] = 1
-        engine_kwargs["max_loras"] = lora_cfg.max_loras
-        if lora_cfg.max_cpu_loras is not None:
-            engine_kwargs["max_cpu_loras"] = lora_cfg.max_cpu_loras
-        engine_kwargs["fully_sharded_loras"] = ie_cfg.fully_sharded_loras
-
-        # TODO(devpatel): Bandaid solution, replace this once we have a better
-        # solution for LoRA performance degradation on the vLLM side
-        if ie_cfg.enforce_eager and ie_cfg.backend == "vllm":
-            logger.warning(
-                "LoRA is enabled but inference_engine.enforce_eager=true. "
-                "This combination causes significant performance degradation (2-3x slower generation). "
-                "Automatically setting enforce_eager=false for better performance. "
-            )
-            engine_kwargs["enforce_eager"] = False
-
-    if cfg.generator.rope_scaling is not None:
-        engine_kwargs["rope_scaling"] = cfg.generator.rope_scaling
-    if cfg.generator.rope_theta is not None:
-        engine_kwargs["rope_theta"] = cfg.generator.rope_theta
-    if ie_cfg.served_model_name is not None:
-        engine_kwargs["served_model_name"] = ie_cfg.served_model_name
-
-    return create_ray_wrapped_inference_engines(**engine_kwargs)
-
-
-def create_remote_inference_engines_from_config(cfg: SkyRLTrainConfig, tokenizer: PreTrainedTokenizerBase):
-    # TODO(tgriggs): We may want a separate config for the model name in case
-    # it's different from the name used in the OpenAI API
-    ie_cfg = cfg.generator.inference_engine
-    return create_remote_inference_engines(
-        urls=ie_cfg.remote_urls,
-        model_name=cfg.trainer.policy.model.path,
-        engine_backend=ie_cfg.backend,
-        tokenizer=tokenizer,
-        tensor_parallel_size=ie_cfg.tensor_parallel_size,
-        pipeline_parallel_size=ie_cfg.pipeline_parallel_size,
-        data_parallel_size=ie_cfg.data_parallel_size,
-        expert_parallel_size=ie_cfg.expert_parallel_size,
-    )
 
 
 class BasePPOExp:
@@ -149,7 +59,7 @@ class BasePPOExp:
         self.eval_dataset = self.get_eval_dataset()
         self.colocate_pg = self.get_colocate_pg()
 
-        # New inference resources (created lazily when _SKYRL_USE_NEW_INFERENCE=1)
+        # Inference resources (created lazily in _get_new_inference_client)
         self._server_groups = None
         self._prefill_server_groups = None
         self._decode_server_groups = None
@@ -159,11 +69,11 @@ class BasePPOExp:
     def get_cfg_as_str(cfg: SkyRLTrainConfig) -> str:
         return get_config_as_yaml_str(cfg)
 
-    def get_train_dataset(self):
+    def get_train_dataset(self) -> PromptDataset:
         """Initializes the training dataset.
 
         Returns:
-            PromptDataset: The training dataset.
+            The training dataset.
         """
         prompts_dataset = PromptDataset(
             datasets=self.cfg.data.train_data,
@@ -177,11 +87,11 @@ class BasePPOExp:
         ), f"dataset should be at least as large as `train_batch_size` {self.cfg.trainer.train_batch_size}, got size {len(prompts_dataset)}"
         return prompts_dataset
 
-    def get_eval_dataset(self):
+    def get_eval_dataset(self) -> Optional[PromptDataset]:
         """Initializes the evaluation dataset.
 
         Returns:
-            PromptDataset: The evaluation dataset.
+            The evaluation dataset, or None if evaluation is disabled.
         """
         if self.cfg.trainer.eval_interval > 0 and self.cfg.data.val_data:
             prompts_dataset = PromptDataset(
@@ -203,7 +113,7 @@ class BasePPOExp:
             timeout (int): The timeout for the placement group to be ready.
 
         Returns:
-            ResolvedPlacementGroup: The placement group wrapper for colocated training, or None.
+            The placement group wrapper for colocated training, or None.
         """
         if not self.cfg.trainer.placement.colocate_all:
             return None
@@ -219,11 +129,11 @@ class BasePPOExp:
         get_ray_pg_ready_with_timeout(pg, timeout=timeout)
         return ResolvedPlacementGroup(pg)
 
-    def get_generator(self, cfg, tokenizer, inference_engine_client):
+    def get_generator(self, cfg, tokenizer, inference_engine_client) -> GeneratorInterface:
         """Initializes the generator.
 
         Returns:
-            GeneratorInterface: The generator.
+            The generator.
         """
         if cfg.generator.vision_language_generator:
             from skyrl.train.generators.skyrl_vlm_generator import SkyRLVLMGymGenerator
@@ -252,11 +162,11 @@ class BasePPOExp:
         inference_engine_client,
         generator: GeneratorInterface,
         colocate_pg,
-    ):
+    ) -> RayPPOTrainer:
         """Initializes the trainer.
 
         Returns:
-            RayPPOTrainer: The trainer.
+            The trainer.
         """
         return RayPPOTrainer(
             cfg=cfg,
@@ -269,56 +179,51 @@ class BasePPOExp:
             colocate_pg=colocate_pg,
         )
 
-    def get_tracker(self):
+    def get_tracker(self) -> Tracking:
         """Initializes the tracker for experiment tracking.
 
         Returns:
-            Tracking: The tracker.
+            The tracker.
         """
         return Tracking(
             project_name=self.cfg.trainer.project_name,
             experiment_name=self.cfg.trainer.run_name,
-            backends=self.cfg.trainer.logger,
+            backend=self.cfg.trainer.logger,
             config=self.cfg,
+            tags=self.cfg.trainer.tags,
         )
+
+    def get_trajectory_logger(self) -> TrajectoryLogger:
+        """Initializes the trajectory logger used during eval (and optionally
+        training) to upload (prompt, response, reward) samples to wandb.
+
+        Override in a subclass to swap in a project-specific
+        :class:`TrajectoryLogger` (custom columns, trajectory rendering, or
+        wandb key). The instance is cheap and statefully accumulates rows
+        across evals via the wandb-Table re-create workaround.
+
+        Returns:
+            The trajectory logger.
+        """
+        return TrajectoryLogger()
 
     def get_inference_client(self) -> InferenceEngineInterface:
         """Setup and return the inference engine client.
 
         This is a hook method that can be overridden by subclasses to customize
-        inference engine creation (e.g., FlashRL, custom backends).
+        inference engine creation (e.g., custom clients or backends).
 
         Returns:
-            InferenceEngineInterface: The inference engine client.
+            The inference engine client.
         """
-        if _SKYRL_USE_NEW_INFERENCE:
-            logger.info("Initializing new inference client")
-            return self._get_new_inference_client()
-        else:
-            return self._get_legacy_inference_client()
+        logger.info("Initializing inference client")
+        return self._get_new_inference_client()
 
-    def _get_legacy_inference_client(self) -> InferenceEngineInterface:
-        """Legacy inference client using Ray actors."""
-        if self.cfg.generator.inference_engine.run_engines_locally:
-            inference_engines = create_ray_wrapped_inference_engines_from_config(
-                self.cfg, self.colocate_pg, self.tokenizer
-            )
-        else:
-            inference_engines = create_remote_inference_engines_from_config(self.cfg, self.tokenizer)
-
-        return InferenceEngineClient(
-            inference_engines,
-            self.tokenizer,
-            self.cfg.trainer.policy.model.path,
-            self.cfg.trainer.policy.model.lora,
-            self.cfg.generator.inference_engine,
-        )
-
-    def _get_new_inference_client(self):
+    def _get_new_inference_client(self) -> InferenceEngineInterface:
         """New inference client using HTTP endpoints.
 
         Returns:
-            RemoteInferenceClient: The new inference client.
+            The new inference client.
         """
         from skyrl.backends.skyrl_train.inference_servers.setup import (
             build_new_inference_client,
@@ -342,13 +247,13 @@ class BasePPOExp:
 
         return client
 
-    def _setup_trainer(self):
+    def _setup_trainer(self) -> RayPPOTrainer:
         """Setup and return the trainer.
 
         Instantiates the trainer and all the associated models for training.
 
         Returns:
-            RayPPOTrainer: The trainer.
+            The trainer.
         """
         logger.info(self.get_cfg_as_str(self.cfg))
         os.makedirs(self.cfg.trainer.export_path, exist_ok=True)
@@ -372,6 +277,7 @@ class BasePPOExp:
         # NOTE (sumanthrh): Instantiate tracker before trainer init.
         # We have custom validation before this step to give better error messages.
         tracker = self.get_tracker()
+        self.tracker = tracker
 
         inference_engine_client = self.get_inference_client()
 
@@ -387,15 +293,118 @@ class BasePPOExp:
             generator=generator,
             colocate_pg=self.colocate_pg,
         )
+        if trainer._vllm_metrics_scraper is not None:
+            enable_pd = self.cfg.generator.inference_engine.enable_pd
+            groups = (
+                (self._prefill_server_groups or []) + (self._decode_server_groups or [])
+                if enable_pd
+                else self._server_groups
+            )
+            actors = [actor for group in (groups or []) for actor in group.get_actors()]
+            if actors and self.cfg.generator.inference_engine.backend == "vllm":
+                try:
+                    worker_ids = ray.get([actor.get_ray_worker_id.remote() for actor in actors], timeout=10)
+                    if enable_pd:
+                        num_prefill = sum(len(group.get_actors()) for group in (self._prefill_server_groups or []))
+                        trainer._vllm_metrics_scraper.set_worker_roles(
+                            {"prefill": worker_ids[:num_prefill], "decode": worker_ids[num_prefill:]}
+                        )
+                    else:
+                        trainer._vllm_metrics_scraper.set_worker_ids(worker_ids)
+                except Exception as error:
+                    trainer._vllm_metrics_scraper.set_worker_ids([])
+                    logger.warning(
+                        f"vLLM metrics disabled: could not identify launched workers ({type(error).__name__})"
+                    )
+            elif self.cfg.generator.inference_engine.external_server_urls is not None:
+                try:
+                    asyncio.run(
+                        trainer._vllm_metrics_scraper.set_external_servers(
+                            self.cfg.generator.inference_engine.external_server_urls, enable_pd
+                        )
+                    )
+                except Exception as error:
+                    trainer._vllm_metrics_scraper.set_worker_ids([])
+                    logger.warning(
+                        f"vLLM metrics disabled: could not identify external workers ({type(error).__name__})"
+                    )
+            else:
+                trainer._vllm_metrics_scraper.set_worker_ids([])
+                logger.warning("vLLM metrics disabled: no inference frontend workers identified")
+        # Install the trajectory logger after construction
+        trainer.trajectory_logger = self.get_trajectory_logger()
+        # Expose the trainer on self so callers can log exceptions raised
+        # during `build_models` (which happens before _setup_trainer returns).
+        self.trainer = trainer
 
-        # Build the models
-        trainer.build_models(PolicyWorker, CriticWorker, RefWorker)
+        # Build the models — skipped in simulated-trainer mode (no policy/critic/ref components).
+        # See FullyAsyncConfig.simulate_training / FullyAsyncTrainerSim: steps are simulated
+        # (sleep + pause/resume, no broadcast), typically against external served endpoints.
+        # TODO: we should make a top level TrainerConfig.simulate_training flag to provide a consistent way
+        # for simulating training steps
+        simulate_training = self.cfg.trainer.fully_async.simulate_training
+        if simulate_training:
+            logger.info(
+                "fully_async.simulate_training=True: skipping build_models() — no policy/critic/ref "
+                "models instantiated. Trainer steps will be simulated (sleep + pause/resume, no broadcast)."
+            )
+        else:
+            trainer.build_models(PolicyWorker, CriticWorker, RefWorker)
         return trainer
 
     def run(self):
-        trainer = self._setup_trainer()
-        # Start the training loop
-        asyncio.run(trainer.train())
+        self.trainer = None
+        self.tracker = None
+        status = "failed"
+        annotation = None
+        trainer_cfg = getattr(getattr(self, "cfg", None), "trainer", None)
+        annotation_cfg = getattr(trainer_cfg, "grafana_annotations", None)
+        if annotation_cfg is not None and annotation_cfg.enabled:
+            from skyrl.train.utils.grafana_annotations import GrafanaRunAnnotation
+
+            annotation = GrafanaRunAnnotation(annotation_cfg, trainer_cfg.run_name)
+            annotation.start()
+        try:
+            trainer = self._setup_trainer()
+
+            # Start the training loop
+            async def train_and_finalize():
+                run_status = "failed"
+                try:
+                    await trainer.train()
+                    run_status = "success"
+                finally:
+                    try:
+                        await trainer.finalize_metrics(run_status)
+                    except Exception as finalization_error:
+                        logger.warning(f"Could not finalize run metrics: {finalization_error}")
+
+            asyncio.run(train_and_finalize())
+            status = "success"
+        except Exception as e:
+            # OOMs raised inside actor init (e.g. FSDPPolicyWorkerBase.init_model)
+            # surface here as RayTaskError. Without this they only land in Ray
+            # worker logs; route them through the tracker so wandb users see
+            # them as an `error/tracebacks` table row.
+            if self.trainer is not None and self.trainer.tracker is not None:
+                # Flush metrics already recorded for the in-flight step (e.g.
+                # reward/timing metrics from a completed generation phase)
+                # before log_exception finishes the wandb run.
+                self.trainer.flush_pending_metrics()
+                self.trainer.tracker.log_exception(e, step=self.trainer.global_step)
+            else:
+                logger.error(f"Setup failed before tracker was initialized:\n{e}")
+            raise
+        finally:
+            if annotation is not None:
+                annotation.finish()
+            if self.tracker is not None:
+                try:
+                    self.tracker.run_status = status
+                    self.tracker.update_summary({"run_status": status})
+                    self.tracker.finish(exit_code=0 if status == "success" else 1)
+                except Exception as finalization_error:
+                    logger.warning(f"Could not finish run tracking: {finalization_error}")
 
 
 @ray.remote(num_cpus=1)
@@ -406,7 +415,20 @@ def skyrl_entrypoint(cfg: SkyRLTrainConfig):
 
 
 def main() -> None:
-    # Parse CLI args and build typed config
+    # Peek at trainer.override_entrypoint BEFORE strict config parse: integrations
+    # may add their own config fields that core SkyRLTrainConfig doesn't know
+    # about, so the strict parse would fail. If override is set, dispatch to the
+    # named entrypoint and let it parse with its own extended config.
+    override_entrypoint = None
+    for arg in sys.argv[1:]:
+        if arg.startswith("trainer.override_entrypoint="):
+            override_entrypoint = arg.split("=", 1)[1]
+            break
+    if override_entrypoint:
+        from importlib import import_module
+
+        return import_module(override_entrypoint).main()
+
     cfg = SkyRLTrainConfig.from_cli_overrides(sys.argv[1:])
 
     # validate the arguments

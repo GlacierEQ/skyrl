@@ -2,6 +2,7 @@
 uv run --isolated --extra dev pytest -s tests/train/test_config.py
 """
 
+import pathlib
 import typing
 from dataclasses import dataclass, field
 from enum import Enum
@@ -10,14 +11,37 @@ from typing import Annotated, Optional
 import pytest
 from omegaconf import OmegaConf
 
+from skyrl.backends.skyrl_train.distributed.megatron import quantization_utils
 from skyrl.train.config.config import (
     BaseConfig,
+    DeltaWeightSyncConfig,
+    MegatronConfig,
+    PolicyConfig,
     SkyRLTrainConfig,
+    TrainerConfig,
     _resolve_class_type,
     build_nested_dataclass,
+    overrides_dict_to_dotlist,
 )
-from skyrl.train.utils.utils import validate_cfg
+from skyrl.train.config.sft_config import SFTConfig
+from skyrl.train.utils import utils as train_utils
+from skyrl.train.utils.utils import (
+    _validate_expert_nvfp4_cfg,
+    prepare_runtime_environment,
+    validate_cfg,
+    validate_inference_engine_cfg,
+    validate_megatron_cfg,
+    validate_optimizer_offload_to_disk_cfg,
+)
 from tests.train.util import example_dummy_config
+
+
+def _get_nested_attr(cfg, dotted_path: str):
+    """Resolve a dot-notation config path to its value."""
+    node = cfg
+    for part in dotted_path.split("."):
+        node = getattr(node, part)
+    return node
 
 
 def _make_validated_test_config():
@@ -122,10 +146,631 @@ def test_cli_overrides():
     assert cfg.trainer.algorithm.temperature == 0.7
 
 
+def test_algorithm_loss_defaults():
+    """The default objective is DPPO with per-prompt loss reduction and Dr. GRPO advantages."""
+    cfg = SkyRLTrainConfig.from_cli_overrides([])
+    algorithm = cfg.trainer.algorithm
+    assert algorithm.policy_loss_type == "dppo"
+    assert algorithm.loss_reduction == "prompt_mean"
+    assert algorithm.grpo_norm_by_std is False
+
+
 def test_cli_overrides_empty_args():
     cfg = SkyRLTrainConfig.from_cli_overrides([])
     assert cfg.trainer.policy.model.path == "Qwen/Qwen2.5-1.5B-Instruct"
     assert cfg.trainer.seed == 42
+
+
+def test_cli_overrides_fp8_param_gather():
+    cfg = SkyRLTrainConfig.from_cli_overrides(["trainer.policy.megatron_config.ddp_config.fp8_param_gather=true"])
+    assert cfg.trainer.policy.megatron_config.ddp_config.fp8_param_gather is True
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("vocab_entropy_chunk_size", -1),
+        ("vocab_entropy_chunk_size", True),
+        ("vocab_entropy_chunk_memory_mb", 0),
+        ("vocab_entropy_chunk_memory_mb", True),
+    ],
+)
+def test_trainer_config_rejects_invalid_vocab_entropy_chunking(field_name, value):
+    with pytest.raises(ValueError, match=field_name):
+        TrainerConfig(**{field_name: value})
+
+
+def test_runtime_env_forwards_te_block_scale_mode(monkeypatch):
+    monkeypatch.setenv("NVTE_FP8_BLOCK_SCALING_FP32_SCALES", "1")
+    monkeypatch.setattr(train_utils, "peer_access_supported", lambda **_kwargs: True)
+
+    env_vars = prepare_runtime_environment(example_dummy_config())
+
+    assert env_vars["NVTE_FP8_BLOCK_SCALING_FP32_SCALES"] == "1"
+
+
+def test_runtime_env_supports_fsdp_without_megatron_configs(monkeypatch):
+    monkeypatch.delenv("NVTE_FP8_BLOCK_SCALING_FP32_SCALES", raising=False)
+    monkeypatch.delenv("NVTE_FP8_BLOCK_AMAX_EPSILON", raising=False)
+    monkeypatch.delenv("VLLM_USE_DEEP_GEMM_E8M0", raising=False)
+    monkeypatch.setattr(train_utils, "peer_access_supported", lambda **_kwargs: True)
+    cfg = example_dummy_config()
+    cfg.trainer.strategy = "fsdp"
+    cfg.trainer.policy.megatron_config = None
+    cfg.trainer.ref.megatron_config = None
+
+    env_vars = prepare_runtime_environment(cfg)
+
+    assert "NVTE_FP8_BLOCK_SCALING_FP32_SCALES" not in env_vars
+    assert "VLLM_USE_DEEP_GEMM_E8M0" not in env_vars
+
+
+def test_serialized_fp8_runtime_defaults_to_fp32_scales(monkeypatch):
+    monkeypatch.delenv("NVTE_FP8_BLOCK_SCALING_FP32_SCALES", raising=False)
+    monkeypatch.delenv("VLLM_USE_DEEP_GEMM_E8M0", raising=False)
+    monkeypatch.setattr(train_utils, "has_visible_cuda_device", lambda: True)
+    monkeypatch.setattr(train_utils, "peer_access_supported", lambda **_kwargs: True)
+    monkeypatch.setattr(train_utils, "is_blackwell_or_newer", lambda: False)
+    cfg = example_dummy_config()
+    cfg.generator.inference_engine.fp8_weight_sync_mode = "blockwise"
+
+    env_vars = prepare_runtime_environment(cfg)
+
+    assert env_vars["NVTE_FP8_BLOCK_SCALING_FP32_SCALES"] == "1"
+    assert env_vars["VLLM_USE_DEEP_GEMM_E8M0"] == "0"
+
+
+def test_serialized_fp8_runtime_defaults_to_pow2_scales_on_blackwell(monkeypatch):
+    monkeypatch.delenv("NVTE_FP8_BLOCK_SCALING_FP32_SCALES", raising=False)
+    monkeypatch.delenv("VLLM_USE_DEEP_GEMM_E8M0", raising=False)
+    monkeypatch.setattr(train_utils, "has_visible_cuda_device", lambda: True)
+    monkeypatch.setattr(train_utils, "peer_access_supported", lambda **_kwargs: True)
+    monkeypatch.setattr(train_utils, "is_blackwell_or_newer", lambda: True)
+    cfg = example_dummy_config()
+    cfg.generator.inference_engine.fp8_weight_sync_mode = "blockwise"
+
+    env_vars = prepare_runtime_environment(cfg)
+
+    assert env_vars["NVTE_FP8_BLOCK_SCALING_FP32_SCALES"] == "0"
+    assert env_vars["VLLM_USE_DEEP_GEMM_E8M0"] == "1"
+
+
+def test_serialized_fp8_pow2_scales_reject_disabled_e8m0_on_blackwell(monkeypatch):
+    monkeypatch.delenv("NVTE_FP8_BLOCK_SCALING_FP32_SCALES", raising=False)
+    monkeypatch.setenv("VLLM_USE_DEEP_GEMM_E8M0", "0")
+    monkeypatch.setattr(train_utils, "has_visible_cuda_device", lambda: True)
+    monkeypatch.setattr(train_utils, "peer_access_supported", lambda **_kwargs: True)
+    monkeypatch.setattr(train_utils, "is_blackwell_or_newer", lambda: True)
+    cfg = example_dummy_config()
+    cfg.generator.inference_engine.fp8_weight_sync_mode = "blockwise"
+
+    with pytest.raises(ValueError, match="VLLM_USE_DEEP_GEMM_E8M0=1"):
+        prepare_runtime_environment(cfg)
+
+
+def test_mxfp8_runtime_takes_no_blockwise_scale_pins(monkeypatch):
+    # Both scale-contract vars belong to the blockwise wire; the MXFP8 wire
+    # (compressed-tensors, native E8M0) must neither stage them nor validate
+    # them — VLLM_USE_DEEP_GEMM_E8M0=0 is exactly what the blockwise-Hopper
+    # contract exports, and it must not fail an mxfp8 launch on SM100.
+    monkeypatch.delenv("NVTE_FP8_BLOCK_SCALING_FP32_SCALES", raising=False)
+    monkeypatch.setenv("VLLM_USE_DEEP_GEMM_E8M0", "0")
+    monkeypatch.setattr(train_utils, "peer_access_supported", lambda **_kwargs: True)
+    monkeypatch.setattr(train_utils, "is_blackwell_or_newer", lambda: True)
+    cfg = example_dummy_config()
+    cfg.generator.inference_engine.fp8_weight_sync_mode = "mxfp8"
+
+    env_vars = prepare_runtime_environment(cfg)
+
+    assert "NVTE_FP8_BLOCK_SCALING_FP32_SCALES" not in env_vars
+
+
+@pytest.mark.parametrize("wire", ["blockwise", "mxfp8", "auto"])
+def test_config_construction_accepts_every_fp8_wire_including_auto(wire):
+    """``__post_init__`` runs long before ``fp8_recipe`` is resolved.
+
+    It sees whatever the launch script passed, so it has to admit both concrete
+    wires *and* the unresolved ``"auto"`` -- which validate_megatron_cfg turns
+    into a concrete wire later, from the policy's recipe. A gate here that
+    knows only one wire rejects a valid launch before training ever starts, and
+    the tests that set the attribute on an already-built config never see it.
+    """
+    cfg = SkyRLTrainConfig.from_cli_overrides(
+        [
+            "trainer.strategy=megatron",
+            f"generator.inference_engine.fp8_weight_sync_mode={wire}",
+        ]
+    )
+
+    assert cfg.generator.inference_engine.fp8_weight_sync_mode == wire
+
+
+def test_config_construction_rejects_an_unknown_fp8_wire():
+    with pytest.raises(ValueError, match="Unsupported fp8_weight_sync_mode"):
+        SkyRLTrainConfig.from_cli_overrides(
+            [
+                "trainer.strategy=megatron",
+                "generator.inference_engine.fp8_weight_sync_mode=int4",
+            ]
+        )
+
+
+def test_inference_engine_cfg_rejects_unresolved_auto_sync_mode():
+    # "auto" resolves from the trainer recipe on the megatron training path;
+    # a path that never runs that resolution must reject it with the way out
+    # rather than listing "auto" as an accepted value.
+    cfg = example_dummy_config()
+    cfg.generator.inference_engine.fp8_weight_sync_mode = "auto"
+
+    with pytest.raises(ValueError, match="megatron"):
+        train_utils.validate_inference_engine_cfg(cfg)
+
+
+def test_serialized_fp8_requires_an_explicit_scale_mode_without_a_driver_gpu(monkeypatch):
+    """The contract is baked into the runtime env before ray.init, so a GPU-less
+    head cannot infer it from the workers; guessing Hopper would hand FP32 block
+    scales to Blackwell workers."""
+    monkeypatch.delenv("NVTE_FP8_BLOCK_SCALING_FP32_SCALES", raising=False)
+    monkeypatch.delenv("VLLM_USE_DEEP_GEMM_E8M0", raising=False)
+    monkeypatch.setattr(train_utils, "peer_access_supported", lambda **_kwargs: True)
+    monkeypatch.setattr(train_utils, "has_visible_cuda_device", lambda: False)
+    cfg = example_dummy_config()
+    cfg.generator.inference_engine.fp8_weight_sync_mode = "blockwise"
+
+    with pytest.raises(ValueError, match="NVTE_FP8_BLOCK_SCALING_FP32_SCALES"):
+        prepare_runtime_environment(cfg)
+
+
+def test_serialized_fp8_pow2_scales_set_e8m0_without_a_driver_gpu(monkeypatch):
+    """E8M0 follows the wire scale format, not the driver's device: vLLM picks the
+    per-device form itself, so the default must survive a GPU-less head."""
+    monkeypatch.setenv("NVTE_FP8_BLOCK_SCALING_FP32_SCALES", "0")
+    monkeypatch.delenv("VLLM_USE_DEEP_GEMM_E8M0", raising=False)
+    monkeypatch.setattr(train_utils, "peer_access_supported", lambda **_kwargs: True)
+    monkeypatch.setattr(train_utils, "has_visible_cuda_device", lambda: False)
+    monkeypatch.setattr(train_utils, "is_blackwell_or_newer", lambda: False)
+    cfg = example_dummy_config()
+    cfg.generator.inference_engine.fp8_weight_sync_mode = "blockwise"
+
+    env_vars = prepare_runtime_environment(cfg)
+
+    assert env_vars["NVTE_FP8_BLOCK_SCALING_FP32_SCALES"] == "0"
+    assert env_vars["VLLM_USE_DEEP_GEMM_E8M0"] == "1"
+
+
+@pytest.mark.parametrize("backend", ["sharded_rdt", "delta"])
+def test_serialized_fp8_weight_sync_rejects_backends_without_a_chunk_channel(backend):
+    """Neither backend carries payload + scale pairs, and both would otherwise
+    fail only at the first sync -- after vLLM has loaded as FP8."""
+    cfg = _make_validated_test_config()
+    cfg.trainer.strategy = "megatron"
+    cfg.generator.inference_engine.fp8_weight_sync_mode = "blockwise"
+    cfg.generator.inference_engine.weight_sync_backend = backend
+
+    with pytest.raises(ValueError, match=backend):
+        validate_inference_engine_cfg(cfg)
+
+
+def test_serialized_fp8_weight_sync_requires_megatron():
+    cfg = _make_validated_test_config()
+    cfg.trainer.strategy = "fsdp"
+    cfg.generator.inference_engine.fp8_weight_sync_mode = "blockwise"
+
+    with pytest.raises(ValueError, match="requires trainer.strategy='megatron'"):
+        validate_inference_engine_cfg(cfg)
+
+
+def test_serialized_fp8_weight_sync_rejects_adapter_only_megatron_lora():
+    cfg = _make_validated_test_config()
+    cfg.trainer.strategy = "megatron"
+    cfg.generator.inference_engine.fp8_weight_sync_mode = "blockwise"
+    cfg.trainer.policy.model.lora.rank = 8
+    cfg.trainer.policy.megatron_config.lora_config.merge_lora = False
+
+    with pytest.raises(ValueError, match="requires full-weight updates"):
+        validate_inference_engine_cfg(cfg)
+
+
+def test_megatron_fp8_compute_defaults_to_fp32_scales_without_serialized_sync(monkeypatch):
+    monkeypatch.delenv("NVTE_FP8_BLOCK_SCALING_FP32_SCALES", raising=False)
+    monkeypatch.setattr(train_utils, "has_visible_cuda_device", lambda: True)
+    monkeypatch.setattr(train_utils, "peer_access_supported", lambda **_kwargs: True)
+    monkeypatch.setattr(train_utils, "is_blackwell_or_newer", lambda: False)
+    cfg = example_dummy_config()
+    cfg.trainer.policy.megatron_config.transformer_config_kwargs["fp8"] = "hybrid"
+
+    env_vars = prepare_runtime_environment(cfg)
+
+    assert env_vars["NVTE_FP8_BLOCK_SCALING_FP32_SCALES"] == "1"
+
+
+def test_power_2_mode_rejects_persistent_fp8_without_serialized_sync(monkeypatch):
+    monkeypatch.setenv("NVTE_FP8_BLOCK_SCALING_FP32_SCALES", "0")
+    monkeypatch.setattr(train_utils, "peer_access_supported", lambda **_kwargs: True)
+    cfg = example_dummy_config()
+    cfg.trainer.policy.megatron_config.transformer_config_kwargs["fp8_param"] = True
+
+    with pytest.raises(ValueError, match="fp8_param=false on Blackwell"):
+        prepare_runtime_environment(cfg)
+
+
+def test_megatron_validation_requires_fp8_param_gather_for_training():
+    cfg = _make_validated_test_config()
+    cfg.trainer.strategy = "megatron"
+    cfg.trainer.policy.megatron_config.transformer_config_kwargs["fp8_param"] = True
+    cfg.trainer.policy.megatron_config.ddp_config.fp8_param_gather = False
+
+    with pytest.raises(ValueError, match="fp8_param_gather=true"):
+        train_utils.validate_megatron_cfg(cfg)
+
+
+def test_megatron_top_level_fp8_fields_fold_into_transformer_config_kwargs():
+    from skyrl.train.config.config import MegatronConfig
+
+    cfg = MegatronConfig(fp8="e4m3", fp8_recipe="auto", fp8_param=True, fp8_amax_compute_algo="most_recent")
+    assert cfg.transformer_config_kwargs["fp8"] == "e4m3"
+    assert cfg.transformer_config_kwargs["fp8_recipe"] == "auto"
+    assert cfg.transformer_config_kwargs["fp8_param"] is True
+    assert cfg.transformer_config_kwargs["fp8_amax_compute_algo"] == "most_recent"
+    # Defaults stay off: no FP8 keys appear unless requested.
+    assert "fp8" not in MegatronConfig().transformer_config_kwargs
+
+
+def test_megatron_explicit_transformer_config_kwargs_override_top_level_fp8_fields():
+    from skyrl.train.config.config import MegatronConfig
+
+    cfg = MegatronConfig(fp8="e4m3", fp8_recipe="blockwise", transformer_config_kwargs={"fp8_recipe": "mxfp8"})
+    assert cfg.transformer_config_kwargs["fp8_recipe"] == "mxfp8"
+    assert cfg.transformer_config_kwargs["fp8"] == "e4m3"
+
+
+def test_megatron_bf16_layer_counts_fold_into_first_last_layers_bf16():
+    from skyrl.train.config.config import MegatronConfig
+
+    cfg = MegatronConfig(fp8="e4m3", num_layers_at_end_in_bf16=2)
+
+    assert cfg.transformer_config_kwargs["first_last_layers_bf16"] is True
+    assert cfg.transformer_config_kwargs["num_layers_at_start_in_bf16"] == 0
+    assert cfg.transformer_config_kwargs["num_layers_at_end_in_bf16"] == 2
+    # Megatron's own defaults (one BF16 layer at each end once enabled) never apply implicitly.
+    assert "first_last_layers_bf16" not in MegatronConfig(fp8="e4m3").transformer_config_kwargs
+
+
+def test_megatron_rejects_two_per_module_precision_sources():
+    from skyrl.train.config.config import MegatronConfig
+
+    with pytest.raises(ValueError, match="only use one"):
+        MegatronConfig(
+            fp8="e4m3", fp8_exclude_modules=["*.shared_experts.*"], te_precision_config_file="/tmp/recipe.yaml"
+        )
+
+
+@pytest.mark.parametrize("pattern", ["decoder.layers.0.*", "*.layers.[0-3].*"])
+def test_megatron_rejects_layer_indexed_fp8_exclusions_under_pipeline_parallelism(pattern):
+    from skyrl.train.config.config import MegatronConfig
+
+    with pytest.raises(ValueError, match="within each pipeline stage"):
+        MegatronConfig(fp8="e4m3", pipeline_model_parallel_size=2, fp8_exclude_modules=[pattern])
+    MegatronConfig(fp8="e4m3", pipeline_model_parallel_size=2, fp8_exclude_modules=["*.shared_experts.*"])
+    MegatronConfig(fp8="e4m3", pipeline_model_parallel_size=2, fp8_exclude_modules=["mtp.layers.0.*"])
+    MegatronConfig(fp8="e4m3", fp8_exclude_modules=[pattern])
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"fp8_exclude_modules": ["*.shared_experts.*"]},
+        {"num_layers_at_start_in_bf16": 1},
+        {"num_layers_at_end_in_bf16": 1},
+    ],
+)
+def test_megatron_rejects_fp8_only_settings_without_fp8(kwargs):
+    from skyrl.train.config.config import MegatronConfig
+
+    with pytest.raises(ValueError, match="FP8 disabled"):
+        MegatronConfig(**kwargs)
+    MegatronConfig(fp8="e4m3", **kwargs)
+    MegatronConfig(transformer_config_kwargs={"fp8": "e4m3"}, **kwargs)
+
+
+def test_expert_nvfp4_uses_the_bf16_layer_counts_and_rejects_fp8_module_exclusions():
+    from skyrl.train.config.config import MegatronConfig
+
+    cfg = MegatronConfig(expert_nvfp4=True, num_layers_at_start_in_bf16=1, num_layers_at_end_in_bf16=7)
+    assert cfg.transformer_config_kwargs["first_last_layers_bf16"] is True
+    assert cfg.transformer_config_kwargs["num_layers_at_start_in_bf16"] == 1
+    assert cfg.transformer_config_kwargs["num_layers_at_end_in_bf16"] == 7
+    with pytest.raises(ValueError, match="expert_nvfp4"):
+        MegatronConfig(expert_nvfp4=True, fp8_exclude_modules=["*.shared_experts.*"])
+    with pytest.raises(ValueError, match="expert_nvfp4"):
+        MegatronConfig(expert_nvfp4=True, te_precision_config_file="/tmp/recipe.yaml")
+
+
+def test_fp8_weight_sync_exclusions_require_fp8_weight_sync():
+    cfg = _make_validated_test_config()
+    cfg.trainer.strategy = "megatron"
+    cfg.generator.inference_engine.fp8_weight_sync_exclude_modules = ["*.layers.0.*"]
+
+    with pytest.raises(ValueError, match="requires fp8_weight_sync_mode"):
+        validate_inference_engine_cfg(cfg)
+
+
+def test_cli_overrides_accept_fp8_exclusion_lists():
+    cfg = SkyRLTrainConfig.from_cli_overrides(
+        [
+            "trainer.strategy=megatron",
+            "trainer.policy.megatron_config.fp8=e4m3",
+            "trainer.policy.megatron_config.fp8_exclude_modules=['*.shared_experts.*']",
+            "trainer.policy.megatron_config.num_layers_at_start_in_bf16=1",
+            "generator.inference_engine.fp8_weight_sync_mode=mxfp8",
+            "generator.inference_engine.fp8_weight_sync_exclude_modules=['*.layers.0.*','*.layers.39.*']",
+        ]
+    )
+
+    megatron_config = cfg.trainer.policy.megatron_config
+    assert list(megatron_config.fp8_exclude_modules) == ["*.shared_experts.*"]
+    assert megatron_config.transformer_config_kwargs["first_last_layers_bf16"] is True
+    assert list(cfg.generator.inference_engine.fp8_weight_sync_exclude_modules) == ["*.layers.0.*", "*.layers.39.*"]
+
+
+@pytest.mark.parametrize(
+    "empty_cuda_cache, optimizer_kwargs, expected",
+    [
+        (None, {}, True),  # GPU optimizer
+        (None, {"optimizer_cpu_offload": True, "optimizer_offload_fraction": 1.0}, False),
+        (None, {"optimizer_cpu_offload": True, "optimizer_offload_fraction": 0.5}, True),  # part of it on GPU
+        (None, {"optimizer_cpu_offload": False, "optimizer_offload_fraction": 1.0}, True),
+        (True, {"optimizer_cpu_offload": True, "optimizer_offload_fraction": 1.0}, True),
+        (False, {}, False),
+    ],
+)
+def test_megatron_empty_cuda_cache_after_backward(empty_cuda_cache, optimizer_kwargs, expected):
+    """Without expandable segments, ``empty_cuda_cache=None`` skips the post-backward empty only when the
+    whole optimizer runs on CPU; an explicit bool always wins."""
+    from skyrl.train.config.config import MegatronConfig
+
+    cfg = MegatronConfig(empty_cuda_cache=empty_cuda_cache, optimizer_config_kwargs=optimizer_kwargs)
+    assert cfg.empty_cuda_cache_after_backward() is expected
+    assert cfg.empty_cuda_cache_after_backward(expandable_segments=False) is expected
+
+
+@pytest.mark.parametrize(
+    "empty_cuda_cache, expandable_segments, after_backward, after_forward",
+    [
+        (None, True, False, False),  # the trainer default: expandable segments do not fragment
+        (None, False, True, True),
+        (True, True, True, True),  # an explicit bool always wins
+        (False, False, False, False),
+    ],
+)
+def test_megatron_empty_cuda_cache_with_expandable_segments(
+    empty_cuda_cache, expandable_segments, after_backward, after_forward
+):
+    """``empty_cuda_cache=None`` skips both per-pass empties under expandable segments."""
+    from skyrl.train.config.config import MegatronConfig
+
+    cfg = MegatronConfig(empty_cuda_cache=empty_cuda_cache)
+    assert cfg.empty_cuda_cache_after_backward(expandable_segments) is after_backward
+    assert cfg.empty_cuda_cache_after_forward(expandable_segments) is after_forward
+
+
+def test_megatron_empty_cuda_cache_from_cli_override():
+    """The CLI form used by launch scripts resolves the same way as the dataclass."""
+    cfg = SkyRLTrainConfig.from_cli_overrides(
+        [
+            "trainer.policy.megatron_config.optimizer_config_kwargs.optimizer_cpu_offload=true",
+            "trainer.policy.megatron_config.optimizer_config_kwargs.optimizer_offload_fraction=1.0",
+        ]
+    )
+    assert cfg.trainer.policy.megatron_config.empty_cuda_cache is None
+    assert cfg.trainer.policy.megatron_config.empty_cuda_cache_after_backward() is False
+
+
+@pytest.mark.parametrize(
+    ("config_cls", "prefix"),
+    [
+        (SkyRLTrainConfig, "trainer.policy.megatron_config"),
+        (SkyRLTrainConfig, "trainer.ref.megatron_config"),
+        (SFTConfig, "megatron_config"),
+    ],
+)
+@pytest.mark.parametrize("key", ["rope_theta", "rope_parameters.rope_theta", "rope_scaling.factor", "q_lora_rank"])
+def test_megatron_config_rejects_unapplied_overrides_in_model_config(config_cls, prefix, key):
+    # Every entrypoint builds a MegatronConfig, including SFT and Tinker, which never call validate_cfg.
+    with pytest.raises(ValueError, match="megatron_config.model_config_kwargs.model_config sets"):
+        config_cls.from_cli_overrides([f"{prefix}.model_config_kwargs.model_config.{key}=500000.0"])
+
+
+@pytest.mark.parametrize(
+    "model_config_kwargs", [{"model_config": {"vocab_size": 151936}}, {"model_config": None}, {}, None]
+)
+def test_megatron_config_allows_other_model_config_overrides(model_config_kwargs):
+    MegatronConfig(model_config_kwargs=model_config_kwargs)
+
+
+def test_megatron_validation_allows_inference_only_fp8_param_without_gather():
+    cfg = _make_validated_test_config()
+    cfg.trainer.strategy = "megatron"
+    cfg.trainer.policy.inference_only_init = True
+    cfg.trainer.policy.megatron_config.transformer_config_kwargs["fp8_param"] = True
+    cfg.trainer.policy.megatron_config.ddp_config.fp8_param_gather = False
+
+    train_utils.validate_megatron_cfg(cfg)
+
+
+@pytest.mark.parametrize(("blackwell", "expected_recipe"), [(True, "mxfp8"), (False, "blockwise")])
+def test_megatron_validation_resolves_auto_fp8_recipe(monkeypatch, blackwell, expected_recipe):
+    monkeypatch.setattr(quantization_utils, "has_visible_cuda_device", lambda: True)
+    monkeypatch.setattr(quantization_utils, "is_blackwell_or_newer", lambda: blackwell)
+    monkeypatch.setattr(train_utils, "is_blackwell_or_newer", lambda: blackwell)
+    cfg = _make_validated_test_config()
+    cfg.trainer.strategy = "megatron"
+    cfg.trainer.policy.megatron_config.transformer_config_kwargs["fp8"] = "e4m3"
+    cfg.trainer.policy.megatron_config.transformer_config_kwargs["fp8_recipe"] = "auto"
+
+    train_utils.validate_megatron_cfg(cfg)
+
+    assert cfg.trainer.policy.megatron_config.transformer_config_kwargs["fp8_recipe"] == expected_recipe
+
+
+def test_megatron_validation_rejects_mxfp8_before_blackwell(monkeypatch):
+    monkeypatch.setattr(quantization_utils, "has_visible_cuda_device", lambda: True)
+    monkeypatch.setattr(quantization_utils, "is_blackwell_or_newer", lambda: False)
+    monkeypatch.setattr(train_utils, "is_blackwell_or_newer", lambda: False)
+    cfg = _make_validated_test_config()
+    cfg.trainer.strategy = "megatron"
+    cfg.trainer.policy.megatron_config.transformer_config_kwargs["fp8"] = "e4m3"
+    cfg.trainer.policy.megatron_config.transformer_config_kwargs["fp8_recipe"] = "mxfp8"
+
+    with pytest.raises(ValueError, match="requires SM100"):
+        train_utils.validate_megatron_cfg(cfg)
+
+
+def test_megatron_validation_rejects_mxfp8_with_fp8_param(monkeypatch):
+    monkeypatch.setattr(quantization_utils, "has_visible_cuda_device", lambda: True)
+    monkeypatch.setattr(quantization_utils, "is_blackwell_or_newer", lambda: True)
+    monkeypatch.setattr(train_utils, "is_blackwell_or_newer", lambda: True)
+    cfg = _make_validated_test_config()
+    cfg.trainer.strategy = "megatron"
+    cfg.trainer.policy.megatron_config.transformer_config_kwargs["fp8"] = "e4m3"
+    cfg.trainer.policy.megatron_config.transformer_config_kwargs["fp8_recipe"] = "mxfp8"
+    cfg.trainer.policy.megatron_config.transformer_config_kwargs["fp8_param"] = True
+    cfg.trainer.policy.megatron_config.ddp_config.fp8_param_gather = True
+
+    with pytest.raises(ValueError, match="not supported with fp8_recipe=mxfp8"):
+        train_utils.validate_megatron_cfg(cfg)
+
+
+def test_serialized_fp8_fp32_scales_reject_vllm_e8m0(monkeypatch):
+    monkeypatch.setenv("NVTE_FP8_BLOCK_SCALING_FP32_SCALES", "1")
+    monkeypatch.setenv("VLLM_USE_DEEP_GEMM_E8M0", "1")
+    monkeypatch.setattr(train_utils, "peer_access_supported", lambda **_kwargs: True)
+    cfg = example_dummy_config()
+    cfg.generator.inference_engine.fp8_weight_sync_mode = "blockwise"
+
+    with pytest.raises(ValueError, match="VLLM_USE_DEEP_GEMM_E8M0=0"):
+        prepare_runtime_environment(cfg)
+
+
+def test_block_sparse_fused_lm_head_requires_fused_path():
+    with pytest.raises(ValueError, match="requires fused_lm_head_logprob=True"):
+        TrainerConfig(strategy="megatron", fused_lm_head_logprob_backend="triton_block_sparse")
+
+
+def test_block_sparse_fused_lm_head_accepts_backend_selection():
+    cfg = TrainerConfig(
+        strategy="megatron",
+        fused_lm_head_logprob=True,
+        fused_lm_head_logprob_backend="triton_block_sparse",
+    )
+    assert cfg.fused_lm_head_logprob_backend == "triton_block_sparse"
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ("generator.sampling_params.temperature=0", "temperature > 0"),
+        ("generator.sampling_params.top_k=1", "top_k > 1"),
+        ("generator.sampling_params.repetition_penalty=1.1", "repetition_penalty=1.0"),
+        ("generator.sampling_params.additional_kwargs.foo=bar", "additional_kwargs"),
+        ("generator.vision_language_generator=true", "vision_language_generator"),
+    ],
+)
+def test_sample_support_capture_rejects_unsupported_sampling_modifiers(override, message):
+    with pytest.raises(ValueError, match=message):
+        SkyRLTrainConfig.from_cli_overrides(
+            [
+                "generator.inference_engine.enable_return_sample_support_set=true",
+                "generator.sampling_params.top_k=8",
+                override,
+            ]
+        )
+
+
+def test_routed_expert_capture_rejects_the_vision_language_generator():
+    with pytest.raises(ValueError, match="vision_language_generator"):
+        SkyRLTrainConfig.from_cli_overrides(
+            [
+                "generator.inference_engine.enable_return_routed_experts=true",
+                "generator.vision_language_generator=true",
+            ]
+        )
+
+
+@pytest.mark.parametrize("strategy", ["megatron", "fsdp"])
+def test_sample_support_replay_requires_capture(strategy):
+    with pytest.raises(ValueError, match="enable_return_sample_support_set"):
+        SkyRLTrainConfig.from_cli_overrides(
+            [
+                "trainer.algorithm.enable_sample_support_replay=true",
+                f"trainer.strategy={strategy}",
+            ]
+        )
+
+
+def test_sample_support_replay_rejects_a_backend_without_a_scorer():
+    with pytest.raises(ValueError, match="requires trainer.strategy=megatron or fsdp"):
+        SkyRLTrainConfig.from_cli_overrides(
+            [
+                "trainer.algorithm.enable_sample_support_replay=true",
+                "trainer.strategy=jax",
+                "generator.inference_engine.enable_return_sample_support_set=true",
+                "generator.sampling_params.top_k=8",
+            ]
+        )
+
+
+@pytest.mark.parametrize("strategy", ["megatron", "fsdp"])
+def test_sample_support_replay_accepts_capture_on_either_backend(strategy):
+    cfg = SkyRLTrainConfig.from_cli_overrides(
+        [
+            "trainer.algorithm.enable_sample_support_replay=true",
+            "generator.inference_engine.enable_return_sample_support_set=true",
+            "generator.sampling_params.top_k=8",
+            f"trainer.strategy={strategy}",
+            "generator.use_conversation_multi_turn=true",
+        ]
+    )
+
+    assert cfg.trainer.algorithm.enable_sample_support_replay
+
+
+def test_sample_support_replay_rejects_single_assistant_message_generation():
+    with pytest.raises(ValueError, match="generator.use_conversation_multi_turn=True"):
+        SkyRLTrainConfig.from_cli_overrides(
+            [
+                "trainer.algorithm.enable_sample_support_replay=true",
+                "generator.inference_engine.enable_return_sample_support_set=true",
+                "generator.sampling_params.top_k=8",
+                "trainer.strategy=megatron",
+                "generator.use_conversation_multi_turn=false",
+            ]
+        )
+
+
+def test_sample_support_capture_accepts_top_k_top_p_and_min_p():
+    cfg = SkyRLTrainConfig.from_cli_overrides(
+        [
+            "generator.inference_engine.enable_return_sample_support_set=true",
+            "generator.sampling_params.top_k=8",
+            "generator.sampling_params.top_p=0.9",
+            "generator.sampling_params.min_p=0.05",
+        ]
+    )
+
+    assert cfg.generator.inference_engine.enable_return_sample_support_set
+
+
+def test_sample_support_capture_leaves_greedy_eval_sampling_params_alone():
+    cfg = SkyRLTrainConfig.from_cli_overrides(
+        [
+            "generator.inference_engine.enable_return_sample_support_set=true",
+            "generator.sampling_params.top_k=8",
+        ]
+    )
+
+    assert cfg.generator.eval_sampling_params.temperature == 0.0
+    assert cfg.generator.eval_sampling_params.top_k == -1
 
 
 def test_cli_overrides_plus_prefix_rejected():
@@ -136,6 +781,304 @@ def test_cli_overrides_plus_prefix_rejected():
 def test_cli_overrides_invalid_field():
     with pytest.raises(ValueError, match="Invalid fields"):
         SkyRLTrainConfig.from_cli_overrides(["trainer.nonexistent_field=value"])
+
+
+def test_remote_urls_override_rejected():
+    with pytest.raises(
+        ValueError,
+        match=(
+            "`remote_urls` is no longer supported, external inference servers can be used with "
+            "`external_proxy_url` and `external_server_urls` instead"
+        ),
+    ):
+        SkyRLTrainConfig.from_cli_overrides(["generator.inference_engine.remote_urls=['http://127.0.0.1:8001']"])
+
+
+def test_async_engine_true_override_is_ignored():
+    cfg = SkyRLTrainConfig.from_cli_overrides(["generator.inference_engine.async_engine=true"])
+
+    assert not hasattr(cfg.generator.inference_engine, "async_engine")
+
+
+def test_async_engine_false_override_rejected():
+    with pytest.raises(ValueError, match="`async_engine=False` is no longer supported"):
+        SkyRLTrainConfig.from_cli_overrides(["generator.inference_engine.async_engine=false"])
+
+
+@pytest.mark.parametrize(
+    ("override", "match"),
+    [
+        (
+            "generator.inference_engine.enable_http_endpoint=true",
+            "`enable_http_endpoint` is no longer supported",
+        ),
+        (
+            "generator.inference_engine.enable_http_endpoint=false",
+            "`enable_http_endpoint` is no longer supported",
+        ),
+        (
+            "generator.inference_engine.override_existing_update_group=enable",
+            "`override_existing_update_group` is no longer supported",
+        ),
+        (
+            "generator.inference_engine.override_existing_update_group=auto",
+            "`override_existing_update_group` is no longer supported",
+        ),
+    ],
+)
+def test_removed_inference_engine_overrides_rejected(override: str, match: str):
+    with pytest.raises(ValueError, match=match):
+        SkyRLTrainConfig.from_cli_overrides([override])
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        "trainer.rope_scaling={'type': 'linear'}",
+        "trainer.rope_theta=10000",
+        "trainer.rope_parameters={'rope_type': 'linear'}",
+        "generator.rope_scaling={'type': 'linear'}",
+        "generator.rope_theta=10000",
+        "generator.rope_parameters={'rope_type': 'linear'}",
+        "generator.inference_engine.rope_scaling={'type': 'linear'}",
+        "generator.inference_engine.rope_theta=10000",
+        "generator.inference_engine.rope_parameters={'rope_type': 'linear'}",
+        "generator.inference_engine.engine_init_kwargs.rope_scaling={'type': 'linear'}",
+        "generator.inference_engine.engine_init_kwargs.rope_theta=10000",
+        "generator.inference_engine.engine_init_kwargs.rope_parameters={'rope_type': 'linear'}",
+        "generator.inference_engine.engine_init_kwargs.hf_overrides.rope_scaling={'type': 'linear'}",
+        "generator.inference_engine.engine_init_kwargs.hf_overrides.rope_theta=10000",
+    ],
+)
+def test_native_rope_overrides_rejected(override):
+    with pytest.raises(
+        ValueError,
+        match="engine_init_kwargs\\.hf_overrides\\.rope_parameters",
+    ):
+        SkyRLTrainConfig.from_cli_overrides([override])
+
+
+def test_hf_overrides_rope_parameters_requires_trainer_side_override():
+    with pytest.raises(
+        ValueError,
+        match="trainer\\.policy\\.model_config_kwargs\\.rope_parameters",
+    ):
+        SkyRLTrainConfig.from_cli_overrides(
+            [
+                "generator.inference_engine.engine_init_kwargs.hf_overrides.rope_parameters.rope_type=linear",
+                "generator.inference_engine.engine_init_kwargs.hf_overrides.rope_parameters.factor=2.0",
+                "generator.inference_engine.engine_init_kwargs.hf_overrides.rope_parameters.rope_theta=10000",
+            ]
+        )
+
+
+def test_hf_overrides_rope_parameters_allowed_with_policy_model_config_kwargs():
+    cfg = SkyRLTrainConfig.from_cli_overrides(
+        [
+            "generator.inference_engine.engine_init_kwargs.hf_overrides.rope_parameters.rope_type=linear",
+            "generator.inference_engine.engine_init_kwargs.hf_overrides.rope_parameters.factor=2.0",
+            "generator.inference_engine.engine_init_kwargs.hf_overrides.rope_parameters.rope_theta=10000",
+            "trainer.policy.model_config_kwargs.rope_parameters.rope_type=linear",
+            "trainer.policy.model_config_kwargs.rope_parameters.factor=2.0",
+            "trainer.policy.model_config_kwargs.rope_parameters.rope_theta=10000",
+        ]
+    )
+
+    assert cfg.generator.inference_engine.engine_init_kwargs["hf_overrides"]["rope_parameters"] == {
+        "rope_type": "linear",
+        "factor": 2.0,
+        "rope_theta": 10000,
+    }
+    assert cfg.trainer.policy.model_config_kwargs["rope_parameters"] == {
+        "rope_type": "linear",
+        "factor": 2.0,
+        "rope_theta": 10000,
+    }
+
+
+def test_hf_overrides_rope_parameters_allowed_with_megatron_transformer_config_kwargs():
+    cfg = SkyRLTrainConfig.from_cli_overrides(
+        [
+            "trainer.strategy=megatron",
+            "generator.inference_engine.engine_init_kwargs.hf_overrides.rope_parameters.rope_type=linear",
+            "generator.inference_engine.engine_init_kwargs.hf_overrides.rope_parameters.factor=2.0",
+            "generator.inference_engine.engine_init_kwargs.hf_overrides.rope_parameters.rope_theta=10000",
+            "trainer.policy.megatron_config.transformer_config_kwargs.rope_parameters.rope_type=linear",
+            "trainer.policy.megatron_config.transformer_config_kwargs.rope_parameters.factor=2.0",
+            "trainer.policy.megatron_config.transformer_config_kwargs.rope_parameters.rope_theta=10000",
+        ]
+    )
+
+    assert cfg.trainer.policy.megatron_config.transformer_config_kwargs["rope_parameters"] == {
+        "rope_type": "linear",
+        "factor": 2.0,
+        "rope_theta": 10000,
+    }
+
+
+def test_hf_overrides_rope_parameters_must_match_fsdp_trainer_side_override():
+    with pytest.raises(
+        ValueError,
+        match="trainer\\.policy\\.model_config_kwargs\\.rope_parameters",
+    ):
+        SkyRLTrainConfig.from_cli_overrides(
+            [
+                "generator.inference_engine.engine_init_kwargs.hf_overrides.rope_parameters.rope_type=linear",
+                "generator.inference_engine.engine_init_kwargs.hf_overrides.rope_parameters.factor=2.0",
+                "generator.inference_engine.engine_init_kwargs.hf_overrides.rope_parameters.rope_theta=10000",
+                "trainer.policy.model_config_kwargs.rope_parameters.rope_type=linear",
+                "trainer.policy.model_config_kwargs.rope_parameters.factor=4.0",
+                "trainer.policy.model_config_kwargs.rope_parameters.rope_theta=10000",
+            ]
+        )
+
+
+def test_hf_overrides_rope_parameters_must_match_megatron_trainer_side_override():
+    with pytest.raises(
+        ValueError,
+        match="trainer\\.policy\\.megatron_config\\.transformer_config_kwargs\\.rope_parameters",
+    ):
+        SkyRLTrainConfig.from_cli_overrides(
+            [
+                "trainer.strategy=megatron",
+                "generator.inference_engine.engine_init_kwargs.hf_overrides.rope_parameters.rope_type=linear",
+                "generator.inference_engine.engine_init_kwargs.hf_overrides.rope_parameters.factor=2.0",
+                "generator.inference_engine.engine_init_kwargs.hf_overrides.rope_parameters.rope_theta=10000",
+                "trainer.policy.model_config_kwargs.rope_parameters.rope_type=linear",
+                "trainer.policy.model_config_kwargs.rope_parameters.factor=2.0",
+                "trainer.policy.model_config_kwargs.rope_parameters.rope_theta=10000",
+            ]
+        )
+
+
+def test_run_engines_locally_false_requires_external_endpoint():
+    cfg = SkyRLTrainConfig()
+    cfg.generator.inference_engine.run_engines_locally = False
+
+    with pytest.raises(ValueError, match="run_engines_locally=false requires"):
+        validate_inference_engine_cfg(cfg)
+
+
+def _pd_cfg_with_role_kwargs(prefill_kwargs=None, decode_kwargs=None) -> SkyRLTrainConfig:
+    """Build a minimally-valid P/D config, optionally with role-specific engine kwargs."""
+    cfg = SkyRLTrainConfig()
+    ie_cfg = cfg.generator.inference_engine
+    ie_cfg.enable_pd = True
+    ie_cfg.num_engines = 2
+    ie_cfg.num_prefill = 1
+    if prefill_kwargs is not None:
+        ie_cfg.prefill_init_kwargs = prefill_kwargs
+    if decode_kwargs is not None:
+        ie_cfg.decode_init_kwargs = decode_kwargs
+    return cfg
+
+
+def test_role_init_kwargs_conflict_with_engine_init_kwargs_rejected():
+    cfg = _pd_cfg_with_role_kwargs(
+        prefill_kwargs={"kv_transfer_config": {"kv_connector": "NixlConnector"}},
+        decode_kwargs={"kv_transfer_config": {"kv_connector": "NixlConnector"}},
+    )
+    cfg.generator.inference_engine.engine_init_kwargs = {"gpu_memory_utilization": 0.8}
+
+    with pytest.raises(ValueError, match="engine_init_kwargs cannot be combined with"):
+        validate_inference_engine_cfg(cfg)
+
+
+def test_role_init_kwargs_require_enable_pd():
+    cfg = SkyRLTrainConfig()
+    cfg.generator.inference_engine.prefill_init_kwargs = {"kv_transfer_config": {"kv_connector": "NixlConnector"}}
+
+    with pytest.raises(ValueError, match="only valid with enable_pd"):
+        validate_inference_engine_cfg(cfg)
+
+
+def test_partial_role_init_kwargs_rejected():
+    # Only prefill_init_kwargs set -> decode_init_kwargs is missing kv_transfer_config.
+    cfg = _pd_cfg_with_role_kwargs(
+        prefill_kwargs={"kv_transfer_config": {"kv_connector": "NixlConnector"}},
+    )
+
+    with pytest.raises(ValueError, match="decode_init_kwargs must set kv_transfer_config"):
+        validate_inference_engine_cfg(cfg)
+
+
+def test_valid_pd_role_init_kwargs_passes():
+    cfg = _pd_cfg_with_role_kwargs(
+        prefill_kwargs={"kv_transfer_config": {"kv_connector": "NixlConnector"}},
+        decode_kwargs={"kv_transfer_config": {"kv_connector": "NixlConnector"}},
+    )
+
+    # Should not raise.
+    validate_inference_engine_cfg(cfg)
+
+
+def test_speculative_config_none_passes():
+    cfg = SkyRLTrainConfig()
+    assert cfg.generator.inference_engine.speculative_config is None
+    # Speculative decoding off: nothing to validate.
+    validate_inference_engine_cfg(cfg)
+
+
+def test_speculative_config_mtp_passes():
+    cfg = SkyRLTrainConfig()
+    cfg.generator.inference_engine.speculative_config = {"method": "mtp", "num_speculative_tokens": 1}
+    validate_inference_engine_cfg(cfg)
+
+
+@pytest.mark.parametrize("method", ["eagle", "eagle3", "draft_model", "medusa", "ngram"])
+def test_speculative_config_rejects_unsupported_method(method):
+    """Only MTP keeps its drafter weights in the policy checkpoint, so only MTP survives
+    a weight sync; the rest would draft with stale weights."""
+    cfg = SkyRLTrainConfig()
+    cfg.generator.inference_engine.speculative_config = {"method": method, "num_speculative_tokens": 1}
+    with pytest.raises(ValueError, match="speculative_config.method"):
+        validate_inference_engine_cfg(cfg)
+
+
+def test_speculative_config_requires_an_explicit_method():
+    """vLLM would otherwise infer the method from the draft model config, letting an
+    unsupported drafter through without ever naming itself."""
+    cfg = SkyRLTrainConfig()
+    cfg.generator.inference_engine.speculative_config = {"model": "some/eagle-head", "num_speculative_tokens": 1}
+    with pytest.raises(ValueError, match="speculative_config.method"):
+        validate_inference_engine_cfg(cfg)
+
+
+def test_offload_kv_for_weight_sync_rejects_colocated():
+    cfg = SkyRLTrainConfig()
+    cfg.trainer.placement.colocate_all = True
+    cfg.generator.inference_engine.offload_kv_for_weight_sync = True
+    with pytest.raises(AssertionError, match="non-colocated weight sync only"):
+        validate_inference_engine_cfg(cfg)
+
+
+def test_offload_kv_for_weight_sync_rejects_lora():
+    cfg = SkyRLTrainConfig()
+    cfg.trainer.placement.colocate_all = False
+    cfg.generator.inference_engine.offload_kv_for_weight_sync = True
+    cfg.trainer.policy.model.lora.rank = 8
+    with pytest.raises(AssertionError, match="does not support LoRA"):
+        validate_inference_engine_cfg(cfg)
+
+
+def test_offload_kv_for_weight_sync_sync_trainer_ok():
+    # Non-fully-async (synchronous trainer) is supported: plain sleep, no in-flight.
+    cfg = SkyRLTrainConfig()
+    cfg.trainer.placement.colocate_all = False
+    cfg.trainer.fully_async.enabled = False
+    cfg.generator.inference_engine.offload_kv_for_weight_sync = True
+    validate_inference_engine_cfg(cfg)
+
+
+@pytest.mark.parametrize("clear_kv_cache", [False, True])
+def test_offload_kv_for_weight_sync_async_ok(clear_kv_cache):
+    cfg = SkyRLTrainConfig()
+    cfg.trainer.placement.colocate_all = False
+    cfg.generator.inference_engine.offload_kv_for_weight_sync = True
+    cfg.trainer.fully_async.enabled = True
+    cfg.trainer.fully_async.clear_kv_cache_on_weight_sync = clear_kv_cache
+    # Both clear_kv_cache settings are supported now.
+    validate_inference_engine_cfg(cfg)
 
 
 def test_temperature_propagation():
@@ -151,8 +1094,6 @@ def test_cross_field_defaults():
         [
             "trainer.max_prompt_length=1024",
             "trainer.policy.model.path=Qwen/Qwen2.5-1.5B-Instruct",
-            "trainer.rope_scaling={'type': 'linear'}",
-            "trainer.rope_theta=10000",
         ]
     )
 
@@ -161,8 +1102,302 @@ def test_cross_field_defaults():
     assert (
         cfg.generator.eval_sampling_params.max_generate_length == cfg.generator.sampling_params.max_generate_length
     )  # same as `generator.sampling_params.max_generate_length`
-    assert cfg.generator.rope_scaling == cfg.trainer.rope_scaling
-    assert cfg.generator.rope_theta == cfg.trainer.rope_theta
+
+
+def test_fake_int4_qat_defaults():
+    """Defaults must stay pinned to the llm-compressor RTN convention, disabled."""
+    cfg = SkyRLTrainConfig.from_cli_overrides([])
+    fq = cfg.trainer.policy.model.fake_int4_qat
+    assert fq.enabled is False
+    assert fq.group_size == 32
+    assert fq.scale_divisor == 7.5
+    assert fq.q_min == -8.0
+    assert fq.bf16_base_path is None
+
+
+def test_fake_int4_qat_cli_overrides():
+    """All convention knobs must be settable from the CLI (the Kimi K2.x convention)."""
+    cfg = SkyRLTrainConfig.from_cli_overrides(
+        [
+            "trainer.strategy=megatron",
+            "trainer.policy.model.lora.rank=32",
+            "trainer.policy.megatron_config.lora_config.merge_lora=false",
+            "trainer.policy.model.fake_int4_qat.enabled=true",
+            "trainer.policy.model.fake_int4_qat.group_size=32",
+            "trainer.policy.model.fake_int4_qat.scale_divisor=7.0",
+            "trainer.policy.model.fake_int4_qat.q_min=-7",
+            "trainer.policy.model.fake_int4_qat.bf16_base_path=/data/bf16-dump",
+        ]
+    )
+    fq = cfg.trainer.policy.model.fake_int4_qat
+    assert fq.enabled is True
+    assert fq.scale_divisor == 7.0
+    assert fq.q_min == -7.0
+    assert fq.bf16_base_path == "/data/bf16-dump"
+
+
+def test_fake_int4_qat_requires_lora():
+    with pytest.raises(AssertionError, match="currently requires LoRA"):
+        SkyRLTrainConfig.from_cli_overrides(["trainer.policy.model.fake_int4_qat.enabled=true"])
+
+
+def test_fake_int4_qat_requires_megatron():
+    with pytest.raises(AssertionError, match="strategy=megatron"):
+        SkyRLTrainConfig.from_cli_overrides(
+            [
+                "trainer.policy.model.lora.rank=32",
+                "trainer.policy.megatron_config.lora_config.merge_lora=false",
+                "trainer.policy.model.fake_int4_qat.enabled=true",
+            ]
+        )
+
+
+def test_fake_int4_qat_requires_unmerged_lora_sync():
+    with pytest.raises(AssertionError, match="merge_lora=False"):
+        SkyRLTrainConfig.from_cli_overrides(
+            [
+                "trainer.strategy=megatron",
+                "trainer.policy.model.lora.rank=32",
+                "trainer.policy.model.fake_int4_qat.enabled=true",
+            ]
+        )
+
+
+class TestOverridesDictToDotlist:
+    """``overrides_dict_to_dotlist`` emits values that ``OmegaConf.from_cli`` parses
+    back to the same Python object. See https://github.com/NovaSky-AI/SkyRL/issues/1567.
+    """
+
+    @pytest.mark.parametrize(
+        ("value", "expected_arg"),
+        [
+            pytest.param(None, "k=null", id="none"),
+            pytest.param(True, "k=true", id="bool-true"),
+            pytest.param(False, "k=false", id="bool-false"),
+            pytest.param(7, "k=7", id="int"),
+            pytest.param(1.5, "k=1.5", id="float"),
+            pytest.param("hello", 'k="hello"', id="str"),
+            pytest.param("null", 'k="null"', id="str-null"),
+            pytest.param("", 'k=""', id="str-empty"),
+            pytest.param("a,b", 'k="a,b"', id="str-comma"),
+            pytest.param("a: b", 'k="a: b"', id="str-colon"),
+            pytest.param(["a", None], 'k=["a", null]', id="list"),
+            pytest.param({"a": 1}, 'k={"a": 1}', id="dict"),
+            # Non-ASCII stays literal: \\uXXXX escaping splits astral-plane
+            # characters into surrogate halves that OmegaConf decodes separately.
+            pytest.param("café", 'k="café"', id="non-ascii-bmp"),
+            pytest.param("run-\U0001f600", 'k="run-\U0001f600"', id="non-ascii-astral"),
+        ],
+    )
+    def test_serialization(self, value, expected_arg):
+        assert overrides_dict_to_dotlist({"k": value}) == [expected_arg]
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            None,
+            True,
+            7,
+            1.5,
+            "hello",
+            "null",
+            "true",
+            "",
+            "1e5",
+            "on",
+            "a,b",
+            "a: b",
+            "[a]",
+            "{a: b}",
+            'say "hi"',
+            "a\nb",
+            "a\\b",
+            "café",
+            "run-\U0001f600",
+            ["http://a:1", "http://b:2"],
+            [],
+            {"a": 1, "b": "x"},
+            {},
+        ],
+    )
+    def test_values_round_trip_through_omegaconf(self, value):
+        (arg,) = overrides_dict_to_dotlist({"k": value})
+        parsed = OmegaConf.to_container(OmegaConf.from_cli([arg]), resolve=False)["k"]
+        assert parsed == value
+        assert type(parsed) is type(value)
+        if isinstance(parsed, str):
+            # Lone surrogates only surface on encode.
+            parsed.encode("utf-8")
+
+    def test_multiple_keys_preserve_order(self):
+        assert overrides_dict_to_dotlist({"a": 1, "b": None}) == ["a=1", "b=null"]
+
+    def test_non_json_serializable_values_fall_back_to_str(self):
+        assert overrides_dict_to_dotlist({"k": pathlib.Path("/tmp/x")}) == ["k=/tmp/x"]
+
+    def test_circular_reference_falls_back_to_str(self):
+        value = {}
+        value["self"] = value
+        (arg,) = overrides_dict_to_dotlist({"k": value})
+        assert arg.startswith("k={")
+
+
+class TestCliOverridesFromDict:
+    """Dict overrides round-trip by type rather than through YAML re-parsing.
+
+    The dict path serializes values into ``key=value`` strings for
+    ``OmegaConf.from_cli``, which re-parses each value with YAML scalar rules.
+    See https://github.com/NovaSky-AI/SkyRL/issues/1567.
+    """
+
+    def test_none_values_stay_none(self):
+        """``None`` values arrive as ``None``, not the string ``"None"``."""
+        cfg = SkyRLTrainConfig.from_cli_overrides(
+            {
+                "generator.inference_engine.external_server_urls": None,
+                "generator.inference_engine.external_proxy_url": None,
+                "generator.inference_engine.served_model_name": None,
+            }
+        )
+        ie_cfg = cfg.generator.inference_engine
+        assert ie_cfg.external_server_urls is None
+        assert ie_cfg.external_proxy_url is None
+        assert ie_cfg.served_model_name is None
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "null",  # YAML null
+            "true",  # YAML bool
+            "false",
+            "",  # empty scalar -> YAML null
+            "[not-a-list]",  # YAML flow sequence
+            "{not: a-dict}",  # YAML flow mapping
+            "name: with colon",  # YAML block mapping
+            "1e5",  # YAML float
+            "on",  # YAML 1.1 bool
+        ],
+    )
+    def test_string_values_stay_strings(self, value):
+        """A ``str`` value stays a ``str``, even when it looks like YAML."""
+        cfg = SkyRLTrainConfig.from_cli_overrides({"generator.inference_engine.served_model_name": value})
+        assert cfg.generator.inference_engine.served_model_name == value
+
+    def test_scalar_and_container_values_keep_their_types(self):
+        cfg = SkyRLTrainConfig.from_cli_overrides(
+            {
+                "generator.inference_engine.max_num_seqs": 512,
+                "generator.sampling_params.temperature": 0.7,
+                "generator.inference_engine.enforce_eager": True,
+                "generator.inference_engine.enable_prefix_caching": False,
+                "generator.inference_engine.external_server_urls": ["http://a:1", "http://b:2"],
+                "generator.inference_engine.engine_init_kwargs": {"a": 1, "b": "x"},
+                "trainer.policy.model.path": "Qwen/Qwen2.5-1.5B-Instruct",
+            }
+        )
+        ie_cfg = cfg.generator.inference_engine
+        assert ie_cfg.max_num_seqs == 512
+        assert cfg.generator.sampling_params.temperature == 0.7
+        assert ie_cfg.enforce_eager is True
+        assert ie_cfg.enable_prefix_caching is False
+        assert ie_cfg.external_server_urls == ["http://a:1", "http://b:2"]
+        assert ie_cfg.engine_init_kwargs == {"a": 1, "b": "x"}
+        assert cfg.trainer.policy.model.path == "Qwen/Qwen2.5-1.5B-Instruct"
+
+    def test_non_json_serializable_values_fall_back_to_str(self):
+        """Values ``json.dumps`` cannot handle serialize via ``str()``."""
+        cfg = SkyRLTrainConfig.from_cli_overrides({"trainer.export_path": pathlib.Path("/tmp/export")})
+        assert cfg.trainer.export_path == "/tmp/export"
+
+    @pytest.mark.parametrize(
+        ("key", "dict_value", "dotlist_arg", "expected"),
+        [
+            pytest.param(
+                "generator.inference_engine.external_server_urls",
+                None,
+                "generator.inference_engine.external_server_urls=null",
+                None,
+                id="none",
+            ),
+            pytest.param(
+                "generator.inference_engine.served_model_name",
+                "null",
+                "generator.inference_engine.served_model_name='null'",
+                "null",
+                id="str-null",
+            ),
+            pytest.param(
+                "generator.inference_engine.external_server_urls",
+                ["http://a:1"],
+                "generator.inference_engine.external_server_urls=['http://a:1']",
+                ["http://a:1"],
+                id="list",
+            ),
+        ],
+    )
+    def test_dict_and_dotlist_paths_agree(self, key, dict_value, dotlist_arg, expected):
+        """A dict override matches the dotlist spelling of the same value."""
+        from_dict = SkyRLTrainConfig.from_cli_overrides({key: dict_value})
+        from_list = SkyRLTrainConfig.from_cli_overrides([dotlist_arg])
+        assert _get_nested_attr(from_dict, key) == expected
+        assert _get_nested_attr(from_list, key) == expected
+
+    def test_plus_prefix_rejected_from_dict(self):
+        """``'+'``-prefixed keys are rejected on the dict path."""
+        with pytest.raises(ValueError, match="The '\\+' prefix"):
+            SkyRLTrainConfig.from_cli_overrides({"+new_field": "value"})
+
+
+class TestTrainerUseSamplePackingAlias:
+    """`trainer.use_sample_packing` is a deprecated alias for `trainer.remove_microbatch_padding`
+    on the RL entrypoint config (mirrors the ``fsdp2``->``fsdp`` alias)."""
+
+    def test_trainer_use_sample_packing_remapped_with_warning(self):
+        with pytest.warns(DeprecationWarning, match="trainer.use_sample_packing.*has been renamed"):
+            cfg = SkyRLTrainConfig.from_cli_overrides(["trainer.use_sample_packing=false"])
+        assert cfg.trainer.remove_microbatch_padding is False
+
+    def test_trainer_use_sample_packing_remapped_from_dict(self):
+        # The Tinker backend passes overrides as a dict of dotted keys.
+        with pytest.warns(DeprecationWarning, match="trainer.use_sample_packing.*has been renamed"):
+            cfg = SkyRLTrainConfig.from_cli_overrides({"trainer.use_sample_packing": True})
+        assert cfg.trainer.remove_microbatch_padding is True
+
+    def test_trainer_use_sample_packing_with_new_key_raises(self):
+        with pytest.raises(ValueError, match="only one of trainer.use_sample_packing"):
+            SkyRLTrainConfig.from_cli_overrides(
+                ["trainer.use_sample_packing=true", "trainer.remove_microbatch_padding=false"]
+            )
+
+
+class TestSkyRLTrainConfig:
+    @pytest.mark.parametrize(
+        ("overrides", "expected_num_workers", "expected_persistent"),
+        [
+            pytest.param([], 8, False, id="default-no-http"),
+            pytest.param(["data.dataloader.num_workers=0"], 0, False, id="explicit-zero"),
+            pytest.param(["data.dataloader.persistent_workers=true"], 8, True, id="persistent-keeps-default-workers"),
+        ],
+    )
+    def test_resolution(self, overrides: list[str], expected_num_workers: int, expected_persistent: bool) -> None:
+        cfg = SkyRLTrainConfig.from_cli_overrides(overrides)
+        assert cfg.data.dataloader.num_workers == expected_num_workers
+        assert cfg.data.dataloader.persistent_workers == expected_persistent
+
+    @pytest.mark.parametrize(
+        ("overrides", "match"),
+        [
+            pytest.param(
+                ["data.dataloader.num_workers=0", "data.dataloader.persistent_workers=true"],
+                "persistent_workers requires num_workers > 0",
+                id="persistent-without-workers",
+            ),
+            pytest.param(["data.dataloader.num_workers=-1"], "num_workers must be None or >= 0", id="negative-workers"),
+        ],
+    )
+    def test_invalid_raises(self, overrides: list[str], match: str) -> None:
+        with pytest.raises(ValueError, match=match):
+            SkyRLTrainConfig.from_cli_overrides(overrides)
 
 
 class TestMaxSeqLenValidation:
@@ -198,3 +1433,706 @@ class TestMaxSeqLenValidation:
         cfg.trainer.algorithm.max_seq_len = 4096
 
         validate_cfg(cfg)
+
+
+class TestStepWiseRoutedExpertsValidation:
+    @staticmethod
+    def _cfg():
+        cfg = _make_validated_test_config()
+        cfg.trainer.strategy = "megatron"
+        cfg.generator.inference_engine.distributed_executor_backend = "mp"
+        cfg.generator.step_wise_trajectories = True
+        cfg.generator.inference_engine.enable_return_routed_experts = True
+        cfg.trainer.policy.megatron_config.moe_enable_routing_replay = True
+        return cfg
+
+    def test_step_wise_rows_may_carry_routes(self):
+        validate_cfg(self._cfg())
+
+    def test_merged_step_wise_output_refuses_routes(self):
+        cfg = self._cfg()
+        cfg.generator.merge_stepwise_output = True
+
+        with pytest.raises(ValueError, match="prefix-aware merging does not merge routed experts"):
+            validate_cfg(cfg)
+
+
+class TestTorchProfilerConfigValidation:
+    """TorchProfilerConfig validation coverage."""
+
+    @staticmethod
+    def _cfg(**overrides):
+        from skyrl.train.config.config import TorchProfilerConfig
+
+        # Valid default for tests targeting other fields.
+        overrides.setdefault("save_path", "/tmp/skyrl_prof_test")
+        return TorchProfilerConfig(enable=True, **overrides)
+
+    def test_disabled_skips_all_checks(self):
+        from skyrl.train.config.config import TorchProfilerConfig
+
+        TorchProfilerConfig(
+            enable=False, export_type="bogus", activities=["gpu"], ranks=[], active=0, save_path=None
+        ).validate()
+
+    def test_defaults_are_valid_when_enabled(self):
+        self._cfg().validate()  # must not raise
+
+    def test_empty_ranks_rejected(self):
+        with pytest.raises(ValueError, match=r"ranks.*non-empty"):
+            self._cfg(ranks=[]).validate()
+
+    def test_missing_save_path_rejected(self):
+        with pytest.raises(ValueError, match=r"save_path.*must be set"):
+            self._cfg(save_path=None).validate()
+        with pytest.raises(ValueError, match=r"save_path.*must be set"):
+            self._cfg(save_path="").validate()
+
+    def test_cloud_save_path_rejected(self):
+        for uri in ("s3://bucket/run/traces", "gs://bucket/run/traces", "gcs://bucket/run/traces"):
+            with pytest.raises(ValueError, match=r"save_path.*local path"):
+                self._cfg(save_path=uri).validate()
+
+    def test_unknown_activity_rejected(self):
+        with pytest.raises(ValueError, match=r"activities"):
+            self._cfg(activities=["cpu", "gpu"]).validate()
+
+    def test_empty_activities_rejected(self):
+        with pytest.raises(ValueError, match=r"activities.*non-empty"):
+            self._cfg(activities=[]).validate()
+
+    def test_activities_case_insensitive(self):
+        self._cfg(activities=["CPU", "CUDA"]).validate()  # must not raise
+
+    def test_unknown_export_type_rejected(self):
+        with pytest.raises(ValueError, match=r"export_type"):
+            self._cfg(export_type="bogus").validate()
+
+    def test_stacks_requires_with_stack(self):
+        with pytest.raises(ValueError, match=r"with_stack"):
+            self._cfg(export_type="stacks", with_stack=False).validate()
+        self._cfg(export_type="stacks", with_stack=True).validate()
+
+    def test_negative_schedule_field_rejected(self):
+        with pytest.raises(ValueError, match=r"skip_first"):
+            self._cfg(skip_first=-1).validate()
+
+    def test_active_must_be_at_least_one(self):
+        with pytest.raises(ValueError, match=r"active"):
+            self._cfg(active=0).validate()
+
+    def test_validate_cfg_invokes_profiler_validation(self):
+        cfg = _make_validated_test_config()
+        cfg.trainer.policy.torch_profiler_config.enable = True
+        cfg.trainer.policy.torch_profiler_config.save_path = "/tmp/skyrl_prof_test"
+        cfg.trainer.policy.torch_profiler_config.export_type = "bogus"
+        with pytest.raises(ValueError, match=r"export_type"):
+            validate_cfg(cfg)
+
+    # FSDP manual-offload incompatibility.
+
+    def test_fsdp_colocate_all_manual_offload_rejected(self):
+        with pytest.raises(ValueError, match=r"Couldn't swap"):
+            self._cfg().validate(strategy="fsdp", colocate_all=True, colocate_policy_ref=True, fsdp_cpu_offload=False)
+
+    def test_fsdp_colocate_policy_ref_only_rejected(self):
+        with pytest.raises(ValueError, match=r"Couldn't swap"):
+            self._cfg().validate(strategy="fsdp", colocate_all=False, colocate_policy_ref=True, fsdp_cpu_offload=False)
+
+    def test_fsdp_no_colocation_allowed(self):
+        self._cfg().validate(strategy="fsdp", colocate_all=False, colocate_policy_ref=False, fsdp_cpu_offload=False)
+
+    def test_fsdp_native_cpu_offload_allowed(self):
+        self._cfg().validate(strategy="fsdp", colocate_all=True, colocate_policy_ref=True, fsdp_cpu_offload=True)
+
+    def test_megatron_colocation_allowed(self):
+        self._cfg().validate(strategy="megatron", colocate_all=True, colocate_policy_ref=True, fsdp_cpu_offload=False)
+
+    def test_offload_check_skipped_without_context(self):
+        self._cfg().validate()
+
+    def test_validate_cfg_rejects_profiler_under_default_colocation(self):
+        cfg = _make_validated_test_config()
+        cfg.trainer.policy.torch_profiler_config.enable = True
+        cfg.trainer.policy.torch_profiler_config.save_path = "/tmp/skyrl_prof_test"
+        with pytest.raises(ValueError, match=r"Couldn't swap"):
+            validate_cfg(cfg)
+
+    def test_validate_cfg_allows_profiler_with_native_offload(self):
+        cfg = _make_validated_test_config()
+        cfg.trainer.policy.torch_profiler_config.enable = True
+        cfg.trainer.policy.torch_profiler_config.save_path = "/tmp/skyrl_prof_test"
+        cfg.trainer.policy.fsdp_config.cpu_offload = True
+        validate_cfg(cfg)
+
+
+class TestDeltaWeightSyncConfig:
+    """Tests for `DeltaWeightSyncConfig`"""
+
+    def test_delta_weight_sync_defaults(self):
+        cfg = DeltaWeightSyncConfig(sync_dir="my_sync_dir", publish_staging_dir=None, local_checkpoint_dir=None)
+        assert cfg.publish_staging_dir is not None
+        assert cfg.local_checkpoint_dir is not None
+        # `publish_staging_dir` and `local_checkpoint_dir` should be constructed based on `sync_dir`
+        assert "my_sync_dir" in cfg.publish_staging_dir
+        assert "my_sync_dir" in cfg.local_checkpoint_dir
+
+
+def _scale_moe_lora_rank_cfg():
+    cfg = _make_validated_test_config()
+    cfg.trainer.strategy = "megatron"
+    cfg.trainer.policy.model.lora.rank = 64
+    cfg.trainer.policy.megatron_config.lora_config.merge_lora = False
+    cfg.trainer.policy.megatron_config.lora_config.normalize_moe_lora = True
+    cfg.generator.inference_engine.scale_moe_lora_rank = True
+    return cfg
+
+
+def test_scale_moe_lora_rank_accepts_megatron_normalized_adapters():
+    validate_inference_engine_cfg(_scale_moe_lora_rank_cfg())
+
+
+@pytest.mark.parametrize(
+    "field,value,match",
+    [
+        ("strategy", "fsdp", "requires trainer.strategy='megatron'"),
+        ("merge_lora", True, "requires trainer.strategy='megatron'"),
+        ("rank", 0, "requires trainer.strategy='megatron'"),
+        ("normalize_moe_lora", False, "requires megatron_config.lora_config.normalize_moe_lora=true"),
+    ],
+)
+def test_scale_moe_lora_rank_rejects_unsupported_settings(field, value, match):
+    cfg = _scale_moe_lora_rank_cfg()
+    target = {
+        "strategy": cfg.trainer,
+        "merge_lora": cfg.trainer.policy.megatron_config.lora_config,
+        "rank": cfg.trainer.policy.model.lora,
+        "normalize_moe_lora": cfg.trainer.policy.megatron_config.lora_config,
+    }[field]
+    setattr(target, field, value)
+    with pytest.raises(ValueError, match=match):
+        validate_inference_engine_cfg(cfg)
+
+
+@pytest.mark.parametrize("kwargs_name", ["engine_init_kwargs", "prefill_init_kwargs", "decode_init_kwargs"])
+def test_max_expert_lora_rank_is_not_a_user_engine_kwarg(kwargs_name):
+    cfg = _make_validated_test_config()
+    setattr(cfg.generator.inference_engine, kwargs_name, {"additional_config": {"max_expert_lora_rank": 8}})
+    with pytest.raises(ValueError, match="use generator.inference_engine.scale_moe_lora_rank=true"):
+        validate_inference_engine_cfg(cfg)
+
+
+def _memory_lora_megatron_cfg():
+    cfg = _make_validated_test_config()
+    cfg.trainer.strategy = "megatron"
+    cfg.trainer.policy.model.lora.rank = 32
+    cfg.trainer.policy.model.lora.sync_mode = "memory"
+    cfg.trainer.policy.megatron_config.lora_config.merge_lora = False
+    cfg.generator.inference_engine.weight_sync_backend = "nccl"
+    return cfg
+
+
+def test_lora_memory_sync_mode_accepts_megatron_adapter_only_nccl():
+    validate_inference_engine_cfg(_memory_lora_megatron_cfg())
+
+
+def test_lora_sync_mode_rejects_unknown_value():
+    cfg = _memory_lora_megatron_cfg()
+    cfg.trainer.policy.model.lora.sync_mode = "tmpfs"
+    with pytest.raises(ValueError, match="sync_mode must be 'disk' or 'memory'"):
+        validate_inference_engine_cfg(cfg)
+
+
+def test_lora_memory_sync_mode_requires_megatron():
+    cfg = _memory_lora_megatron_cfg()
+    cfg.trainer.strategy = "fsdp"
+    with pytest.raises(ValueError, match="only implemented for trainer.strategy='megatron'"):
+        validate_inference_engine_cfg(cfg)
+
+
+def test_lora_memory_sync_mode_requires_adapter_only_lora():
+    cfg = _memory_lora_megatron_cfg()
+    cfg.trainer.policy.megatron_config.lora_config.merge_lora = True
+    with pytest.raises(ValueError, match="merge_lora=false"):
+        validate_inference_engine_cfg(cfg)
+    cfg = _memory_lora_megatron_cfg()
+    cfg.trainer.policy.model.lora.rank = 0
+    with pytest.raises(ValueError, match="lora.rank > 0"):
+        validate_inference_engine_cfg(cfg)
+
+
+@pytest.mark.parametrize("backend", ["delta", "sharded_rdt"])
+def test_lora_memory_sync_mode_requires_nccl_transport(backend):
+    cfg = _memory_lora_megatron_cfg()
+    cfg.generator.inference_engine.weight_sync_backend = backend
+    with pytest.raises(ValueError, match="weight_sync_backend='nccl'"):
+        validate_inference_engine_cfg(cfg)
+
+
+def test_lora_disk_sync_mode_is_default_and_unconstrained():
+    cfg = _make_validated_test_config()
+    assert cfg.trainer.policy.model.lora.sync_mode == "disk"
+    validate_inference_engine_cfg(cfg)
+
+
+class TestMegatronRouterReplayValidation:
+    @staticmethod
+    def _cfg():
+        cfg = _make_validated_test_config()
+        cfg.trainer.strategy = "megatron"
+        cfg.generator.inference_engine.enable_return_routed_experts = True
+        cfg.trainer.policy.megatron_config.moe_enable_routing_replay = True
+        return cfg
+
+    @pytest.mark.parametrize("vpp_size", [2])
+    def test_routing_replay_refuses_virtual_pipeline_parallelism(self, vpp_size):
+        cfg = self._cfg()
+        cfg.trainer.policy.megatron_config.transformer_config_kwargs["virtual_pipeline_model_parallel_size"] = vpp_size
+
+        with pytest.raises(AssertionError, match="virtual_pipeline_model_parallel_size"):
+            validate_megatron_cfg(cfg)
+
+    # Only sizes above one build interleaved chunks; 1 is a plain non-interleaved schedule,
+    # which megatron_worker.py also permits.
+    @pytest.mark.parametrize("vpp_size", [None, 0, 1])
+    def test_routing_replay_allows_unset_virtual_pipeline_parallelism(self, vpp_size):
+        cfg = self._cfg()
+        cfg.trainer.policy.megatron_config.transformer_config_kwargs["virtual_pipeline_model_parallel_size"] = vpp_size
+
+        validate_megatron_cfg(cfg)
+
+    def test_virtual_pipeline_parallelism_allowed_without_routing_replay(self):
+        cfg = self._cfg()
+        cfg.trainer.policy.megatron_config.moe_enable_routing_replay = False
+        cfg.trainer.policy.megatron_config.transformer_config_kwargs["virtual_pipeline_model_parallel_size"] = 2
+
+        validate_megatron_cfg(cfg)
+
+    @pytest.mark.parametrize("backend", ["mp", "ray"])
+    def test_routing_replay_allows_both_executor_backends(self, backend):
+        cfg = self._cfg()
+        cfg.generator.inference_engine.distributed_executor_backend = backend
+
+        validate_inference_engine_cfg(cfg)
+
+    @pytest.mark.parametrize("backend", ["mp", "ray"])
+    def test_routing_replay_refuses_inference_pipeline_parallelism_without_relay(self, backend, monkeypatch):
+        import skyrl.backends.skyrl_train.patches.vllm.patch_routed_experts_pp_relay as relay
+
+        monkeypatch.setattr(relay, "_relay_status", lambda: "unsupported")
+        cfg = self._cfg()
+        cfg.generator.inference_engine.distributed_executor_backend = backend
+        cfg.generator.inference_engine.pipeline_parallel_size = 2
+
+        with pytest.raises(AssertionError, match="pipeline_parallel_size=1"):
+            validate_inference_engine_cfg(cfg)
+
+    @pytest.mark.parametrize("status", ["native", "patchable"])
+    @pytest.mark.parametrize("backend", ["mp", "ray"])
+    def test_routing_replay_allows_inference_pipeline_parallelism_with_relay(self, backend, status, monkeypatch):
+        import skyrl.backends.skyrl_train.patches.vllm.patch_routed_experts_pp_relay as relay
+
+        monkeypatch.setattr(relay, "_relay_status", lambda: status)
+        cfg = self._cfg()
+        cfg.generator.inference_engine.distributed_executor_backend = backend
+        cfg.generator.inference_engine.pipeline_parallel_size = 2
+        # The mp backend needs each engine's TP*PP workers on one node.
+        cfg.trainer.placement.policy_num_gpus_per_node = 8
+
+        validate_inference_engine_cfg(cfg)
+
+
+@pytest.mark.parametrize(
+    "step_timeout_s,weight_sync_timeout_s,match",
+    [
+        (0, None, "step_timeout_s must be > 0"),
+        (None, -1.0, "weight_sync_timeout_s must be > 0"),
+        (900.0, 1200.0, "weight_sync_timeout_s .* must be <= trainer.step_timeout_s"),
+    ],
+)
+def test_validate_cfg_rejects_invalid_step_timeouts(step_timeout_s, weight_sync_timeout_s, match):
+    cfg = _make_validated_test_config()
+    cfg.trainer.step_timeout_s = step_timeout_s
+    cfg.trainer.weight_sync_timeout_s = weight_sync_timeout_s
+    with pytest.raises(ValueError, match=match):
+        validate_cfg(cfg)
+
+
+def test_validate_step_timeouts_warns_below_nccl_timeout():
+    from loguru import logger
+
+    messages = []
+    handler_id = logger.add(messages.append, level="WARNING")
+    try:
+        nccl_timeout_s = train_utils.SKYRL_WORKER_NCCL_TIMEOUT_IN_S
+        train_utils.validate_step_timeouts(nccl_timeout_s * 2, nccl_timeout_s * 2)
+        assert messages == []
+        train_utils.validate_step_timeouts(nccl_timeout_s * 2, nccl_timeout_s / 2)
+    finally:
+        logger.remove(handler_id)
+    (message,) = messages
+    assert "trainer.weight_sync_timeout_s" in message and "NCCL watchdog" in message
+
+
+def _cp2_megatron_config():
+    cfg = _make_validated_test_config()
+    cfg.trainer.strategy = "megatron"
+    cfg.trainer.remove_microbatch_padding = True
+    cfg.trainer.policy.megatron_config.context_parallel_size = 2
+    return cfg
+
+
+def test_megatron_validation_refuses_mtp_with_cp():
+    cfg = _cp2_megatron_config()
+    cfg.trainer.mtp.enabled = True
+
+    with pytest.raises(ValueError, match="mtp.enabled=true is not supported with context_parallel_size > 1"):
+        train_utils.validate_megatron_cfg(cfg)
+
+
+@pytest.mark.parametrize(
+    "target_modules, raises",
+    [
+        (["linear_qkv", "linear_proj", "output_layer"], True),
+        (["linear_qkv", "linear_proj"], False),
+        ("all-linear", False),
+    ],
+)
+def test_fused_lm_head_logprob_rejects_output_layer_lora(target_modules, raises):
+    """The fused LM head reads output_layer.weight directly, so it would skip an output_layer adapter."""
+    from skyrl.train.config.config import ModelConfig, SkyRLLoraConfig
+
+    policy = PolicyConfig(model=ModelConfig(lora=SkyRLLoraConfig(rank=8, target_modules=target_modules)))
+    if raises:
+        with pytest.raises(ValueError, match="fused_lm_head_logprob=True reads output_layer.weight"):
+            TrainerConfig(strategy="megatron", fused_lm_head_logprob=True, policy=policy)
+    else:
+        TrainerConfig(strategy="megatron", fused_lm_head_logprob=True, policy=policy)
+
+
+_SCORE_CENTERING_BASE = [
+    "trainer.algorithm.enable_score_centering=true",
+    "trainer.algorithm.enable_sample_support_replay=true",
+    "trainer.algorithm.policy_loss_type=rollout_is",
+    "generator.inference_engine.enable_return_sample_support_set=true",
+    "generator.sampling_params.top_k=8",
+    "trainer.strategy=megatron",
+]
+
+
+def test_score_centering_accepts_replay_rollout_is_and_a_sequence_mask():
+    cfg = SkyRLTrainConfig.from_cli_overrides(
+        [*_SCORE_CENTERING_BASE, "trainer.algorithm.off_policy_correction.sequence_mask_metric=geometric"]
+    )
+
+    assert cfg.trainer.algorithm.enable_score_centering
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        ["trainer.algorithm.policy_loss_type=reinforce"],
+        ["trainer.algorithm.policy_loss_type=cispo", "trainer.algorithm.cispo.cispo_anchor=rollout"],
+        ["trainer.algorithm.policy_loss_type=dppo"],
+    ],
+)
+def test_score_centering_accepts_every_sampler_anchored_loss(overrides):
+    cfg = SkyRLTrainConfig.from_cli_overrides([*_SCORE_CENTERING_BASE, *overrides])
+
+    assert cfg.trainer.algorithm.enable_score_centering
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ("trainer.algorithm.enable_sample_support_replay=false", "requires enable_sample_support_replay"),
+        ("trainer.algorithm.policy_loss_type=regular", "weighted relative to the sampler"),
+        ("trainer.algorithm.policy_loss_type=gspo", "weighted relative to the sampler"),
+        ("trainer.algorithm.policy_loss_type=cispo", "weighted relative to the sampler"),
+        ("trainer.algorithm.off_policy_correction.tis_ratio_type=token", "tis_ratio_type"),
+        ("trainer.algorithm.off_policy_correction.tis_ratio_type=sequence", "tis_ratio_type"),
+        ("trainer.algorithm.off_policy_correction.token_mask_is_threshold_low=0.5", "token_mask_is_threshold"),
+        ("trainer.algorithm.off_policy_correction.token_mask_is_threshold_high=2.0", "token_mask_is_threshold"),
+    ],
+)
+def test_score_centering_rejects_what_breaks_its_drift_cancellation(override, message):
+    with pytest.raises(ValueError, match=message):
+        SkyRLTrainConfig.from_cli_overrides([*_SCORE_CENTERING_BASE, override])
+
+
+_SCORE_CENTERING_AUTO_BASE = [o for o in _SCORE_CENTERING_BASE if not o.startswith("trainer.algorithm.enable_score_")]
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        [],
+        ["trainer.algorithm.policy_loss_type=reinforce"],
+        ["trainer.algorithm.policy_loss_type=cispo", "trainer.algorithm.cispo.cispo_anchor=rollout"],
+        ["trainer.algorithm.policy_loss_type=dppo"],
+        ["trainer.algorithm.off_policy_correction.sequence_mask_metric=geometric"],
+    ],
+)
+def test_score_centering_default_enables_with_replay_and_a_sampler_anchored_loss(overrides):
+    cfg = SkyRLTrainConfig.from_cli_overrides(
+        [*_SCORE_CENTERING_AUTO_BASE, "trainer.algorithm.enable_sample_support_replay=true", *overrides]
+    )
+
+    assert cfg.trainer.algorithm.enable_score_centering is True
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        ["trainer.algorithm.enable_sample_support_replay=false"],
+        ["trainer.algorithm.enable_sample_support_replay=true", "trainer.algorithm.policy_loss_type=regular"],
+        ["trainer.algorithm.enable_sample_support_replay=true", "trainer.algorithm.policy_loss_type=cispo"],
+        [
+            "trainer.algorithm.enable_sample_support_replay=true",
+            "trainer.algorithm.off_policy_correction.tis_ratio_type=token",
+        ],
+        [
+            "trainer.algorithm.enable_sample_support_replay=true",
+            "trainer.algorithm.off_policy_correction.token_mask_is_threshold_low=0.5",
+        ],
+        # An explicit false wins over a configuration that would otherwise enable it.
+        ["trainer.algorithm.enable_sample_support_replay=true", "trainer.algorithm.enable_score_centering=false"],
+    ],
+)
+def test_score_centering_default_stays_off_where_it_does_not_apply(overrides):
+    cfg = SkyRLTrainConfig.from_cli_overrides([*_SCORE_CENTERING_AUTO_BASE, *overrides])
+
+    assert cfg.trainer.algorithm.enable_score_centering is False
+
+
+def test_score_centering_rejects_legacy_use_tis():
+    """use_tis becomes tis_ratio_type="token" only in validate_cfg, after the default resolves."""
+    auto = [*_SCORE_CENTERING_AUTO_BASE, "trainer.algorithm.enable_sample_support_replay=true"]
+    cfg = SkyRLTrainConfig.from_cli_overrides([*auto, "trainer.algorithm.use_tis=true"])
+    assert cfg.trainer.algorithm.enable_score_centering is False
+
+    with pytest.raises(ValueError, match="use_tis"):
+        SkyRLTrainConfig.from_cli_overrides([*_SCORE_CENTERING_BASE, "trainer.algorithm.use_tis=true"])
+
+
+def test_score_centering_default_enables_with_replay_on_the_default_loss():
+    """policy_loss_type defaults to dppo, so turning on replay alone turns on score centering."""
+    overrides = [
+        o
+        for o in _SCORE_CENTERING_AUTO_BASE
+        if not o.startswith("trainer.algorithm.policy_loss_type") and not o.startswith("trainer.algorithm.enable_")
+    ]
+    cfg = SkyRLTrainConfig.from_cli_overrides([*overrides, "trainer.algorithm.enable_sample_support_replay=true"])
+
+    assert cfg.trainer.algorithm.policy_loss_type == "dppo"
+    assert cfg.trainer.algorithm.enable_score_centering is True
+
+
+def test_score_centering_default_is_off_for_the_default_config():
+    assert SkyRLTrainConfig().trainer.algorithm.enable_score_centering is False
+
+
+@pytest.mark.parametrize(
+    "overrides, match",
+    [
+        ({"trainer.strategy": "fsdp"}, "requires trainer.strategy=megatron"),
+        ({"trainer.policy.model.lora.rank": 8}, "does not support LoRA"),
+        ({"trainer.ckpt_path": "s3://bucket/ckpts"}, "local trainer.ckpt_path"),
+        ({"trainer.ref.megatron_config.optimizer_offload_to_disk.dir": "/tmp/state"}, "policy only"),
+    ],
+)
+def test_optimizer_offload_to_disk_rejects_settings_it_cannot_honor(overrides, match):
+    cfg = _make_validated_test_config()
+    cfg.trainer.strategy = "megatron"
+    cfg.trainer.policy.megatron_config.optimizer_offload_to_disk.dir = "/tmp/state"
+    for path, value in overrides.items():
+        *parents, name = path.split(".")
+        setattr(_get_nested_attr(cfg, ".".join(parents)), name, value)
+
+    with pytest.raises(ValueError, match=match):
+        validate_optimizer_offload_to_disk_cfg(cfg)
+
+
+def test_expert_nvfp4_stacked_sync_default_on_and_ignored_without_expert_nvfp4():
+    cfg = _make_validated_test_config()
+    cfg.trainer.strategy = "megatron"
+    assert cfg.trainer.policy.megatron_config.expert_nvfp4_stacked_sync is True
+    assert cfg.trainer.policy.megatron_config.expert_nvfp4 is False
+    validate_megatron_cfg(cfg)  # a no-op without expert_nvfp4: must not raise
+
+
+def _expert_nvfp4_config(mode="w4a16"):
+    cfg = _make_validated_test_config()
+    cfg.trainer.strategy = "megatron"
+    cfg.trainer.policy.megatron_config.expert_nvfp4 = True
+    cfg.trainer.policy.megatron_config.expert_nvfp4_mode = mode
+    return cfg
+
+
+# FlashInfer's whole NVFP4 env, every value explicit (only "1" is true for FlashInfer).
+_FI_ENV = {
+    "FLASHINFER_NVFP4_4OVER6_ERR_MODE": "MSE",
+    "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH": "1",
+    "FLASHINFER_NVFP4_4OVER6_E4M3_USE_256": "0",
+    "FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH": "0",
+    "TRTLLM_DISABLE_FP4_QUANT_FAST_MATH": "0",
+}
+
+
+def _nvfp4_env(env_vars):
+    return {
+        k: v for k, v in env_vars.items() if k.startswith(("FLASHINFER_", "TRTLLM_", "NVTE_NVFP4", "NVTE_BACKWARD"))
+    }
+
+
+def test_expert_nvfp4_defaults_to_w4a16_with_four_over_six():
+    cfg = SkyRLTrainConfig.from_cli_overrides(
+        ["trainer.strategy=megatron", "trainer.policy.megatron_config.expert_nvfp4=true"]
+    )
+    mc = cfg.trainer.policy.megatron_config
+    assert (mc.expert_nvfp4_mode, mc.expert_nvfp4_block_scale) == ("w4a16", "four_over_six")
+
+
+@pytest.mark.parametrize("block_scale", ["absmax", "four_over_six"])
+def test_expert_nvfp4_trainer_rounding_defaults_to_the_rollouts_grid(block_scale):
+    """``expert_nvfp4_*_rounding.four_over_six`` follows ``expert_nvfp4_block_scale`` unless set; stochastic rounding
+    is off by default."""
+    cfg = _expert_nvfp4_config("w4a4")
+    mc = cfg.trainer.policy.megatron_config
+    mc.expert_nvfp4_block_scale = block_scale
+    _validate_expert_nvfp4_cfg(cfg)
+    for rounding in (mc.expert_nvfp4_weight_rounding, mc.expert_nvfp4_activation_rounding):
+        assert rounding.four_over_six is (block_scale == "four_over_six") and rounding.stochastic_rounding is False
+
+
+@pytest.mark.parametrize("field", ["expert_nvfp4_weight_rounding", "expert_nvfp4_activation_rounding"])
+def test_expert_nvfp4_trainer_rounding_may_differ_from_the_rollouts(field):
+    cfg = _expert_nvfp4_config("w4a4")
+    rounding = getattr(cfg.trainer.policy.megatron_config, field)
+    rounding.four_over_six, rounding.stochastic_rounding = False, True
+    _validate_expert_nvfp4_cfg(cfg)
+    assert rounding.four_over_six is False and rounding.stochastic_rounding is True
+
+
+def test_expert_nvfp4_stochastic_inputs_need_w4a4():
+    cfg = _expert_nvfp4_config("w4a16")
+    cfg.trainer.policy.megatron_config.expert_nvfp4_activation_rounding.stochastic_rounding = True
+    with pytest.raises(ValueError, match="only expert_nvfp4_mode=w4a4"):
+        _validate_expert_nvfp4_cfg(cfg)
+
+
+@pytest.mark.parametrize("mode", ["w4a16", "w4a4"])
+@pytest.mark.parametrize("colocated", [False, True])
+def test_expert_nvfp4_accepts_packed_push_backends(colocated, mode):
+    cfg = _expert_nvfp4_config(mode)
+    cfg.trainer.placement.colocate_all = colocated
+    _validate_expert_nvfp4_cfg(cfg)
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        ({"trainer.strategy": "fsdp"}, "trainer.strategy=megatron"),
+        ({"trainer.policy.megatron_config.expert_nvfp4_mode": "bogus"}, "expert_nvfp4_mode must be one of"),
+        ({"generator.inference_engine.weight_sync_backend": "sharded_rdt"}, "NCCL or CUDA-IPC"),
+        ({"generator.inference_engine.weight_sync_backend": "delta"}, "NCCL or CUDA-IPC"),
+        ({"generator.inference_engine.fp8_weight_sync_mode": "fp8"}, "mutually exclusive"),
+        ({"trainer.policy.model.lora.rank": 8}, "full-parameter"),
+        ({"trainer.policy.megatron_config.moe_grouped_gemm": False}, "moe_grouped_gemm"),
+        ({"trainer.policy.megatron_config.expert_tensor_parallel_size": 2}, "expert_tensor_parallel_size: 1"),
+        ({"trainer.policy.megatron_config.tensor_model_parallel_size": 2}, "takes from tensor_model_parallel_size"),
+        ({"trainer.policy.megatron_config.transformer_config_kwargs": {"quant_recipe": {}}}, "quant_recipe"),
+        ({"trainer.mtp.enabled": True}, "MTP"),
+    ],
+)
+def test_expert_nvfp4_rejects_unsupported_setups(overrides, message):
+    cfg = _expert_nvfp4_config()
+    for path, value in overrides.items():
+        *parents, leaf = path.split(".")
+        setattr(_get_nested_attr(cfg, ".".join(parents)), leaf, value)
+    with pytest.raises(ValueError, match=message):
+        _validate_expert_nvfp4_cfg(cfg)
+
+
+@pytest.mark.parametrize("value", [False, "false", "e4m3", True])
+@pytest.mark.parametrize("key", ["fp8", "fp4"])
+def test_expert_nvfp4_rejects_any_set_fp8_or_fp4(key, value):
+    """Megatron enables FP8 / FP4 for any value but None, so even ``False`` is rejected at config time."""
+    cfg = _expert_nvfp4_config()
+    cfg.trainer.policy.megatron_config.transformer_config_kwargs[key] = value
+    with pytest.raises(ValueError, match=r"fp8 / fp4 unset \(None\)"):
+        _validate_expert_nvfp4_cfg(cfg)
+
+
+def test_expert_nvfp4_rejects_a_disabled_top_level_fp8():
+    """``megatron_config.fp8`` folds into ``transformer_config_kwargs["fp8"]`` whenever it is not None."""
+    from skyrl.train.config.config import MegatronConfig
+
+    cfg = _expert_nvfp4_config()
+    folded = MegatronConfig(expert_nvfp4=True, fp8="false").transformer_config_kwargs
+    cfg.trainer.policy.megatron_config.transformer_config_kwargs = folded
+    with pytest.raises(ValueError, match=r"fp8 / fp4 unset \(None\)"):
+        _validate_expert_nvfp4_cfg(cfg)
+
+
+def test_expert_nvfp4_accepts_unset_fp8_and_fp4():
+    cfg = _expert_nvfp4_config()
+    cfg.trainer.policy.megatron_config.transformer_config_kwargs.update(fp8=None, fp4=None)
+    _validate_expert_nvfp4_cfg(cfg)
+
+
+def test_expert_nvfp4_accepts_tensor_parallel_with_whole_experts():
+    cfg = _expert_nvfp4_config()
+    cfg.trainer.policy.megatron_config.tensor_model_parallel_size = 4
+    cfg.trainer.policy.megatron_config.expert_tensor_parallel_size = 1
+    _validate_expert_nvfp4_cfg(cfg)
+
+
+@pytest.mark.parametrize(
+    "rollout, ok",
+    [
+        (dict(expert_parallel_size=8, tensor_parallel_size=8, data_parallel_size=1), True),
+        (dict(expert_parallel_size=1, tensor_parallel_size=1, data_parallel_size=1), True),
+        (dict(expert_parallel_size=1, tensor_parallel_size=2, data_parallel_size=1), False),
+        (dict(expert_parallel_size=1, tensor_parallel_size=1, data_parallel_size=2), False),
+    ],
+)
+def test_expert_nvfp4_w4a4_needs_whole_fc2_input_rows_on_the_rollouts(rollout, ok):
+    """w4a4 rounds each fc2 input per token over the whole row, as vLLM does under expert parallelism; w4a16 rounds
+    no activations and takes any rollout layout."""
+    for mode in ("w4a16", "w4a4"):
+        cfg = _expert_nvfp4_config(mode)
+        for key, value in rollout.items():
+            setattr(cfg.generator.inference_engine, key, value)
+        if ok or mode == "w4a16":
+            _validate_expert_nvfp4_cfg(cfg)
+        else:
+            with pytest.raises(ValueError, match="cannot match the rollouts' per-token fc2-input scales"):
+                _validate_expert_nvfp4_cfg(cfg)
+
+
+def test_expert_nvfp4_validation_is_a_no_op_when_off():
+    cfg = _make_validated_test_config()
+    cfg.trainer.strategy = "megatron"
+    cfg.generator.inference_engine.weight_sync_backend = "sharded_rdt"
+    _validate_expert_nvfp4_cfg(cfg)
+
+
+@pytest.mark.parametrize("mode", ["w4a16", "w4a4"])
+@pytest.mark.parametrize("block_scale, four_over_six", [("four_over_six", "1"), ("absmax", "0")])
+def test_expert_nvfp4_runtime_environment_is_the_configs_flashinfer_env(monkeypatch, mode, block_scale, four_over_six):
+    """No TE recipe env (NVTE_NVFP4_* / NVTE_BACKWARD_OVERRIDE) is exported, and the engines' FlashInfer env follows
+    expert_nvfp4_block_scale with every key explicit, so a stray exact-math shell setting cannot leak in."""
+    monkeypatch.setattr(train_utils, "peer_access_supported", lambda **_kwargs: True)
+    monkeypatch.setenv("NVTE_NVFP4_4OVER6", "all")
+    monkeypatch.setenv("FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH", "1")
+    cfg = _expert_nvfp4_config(mode)
+    cfg.trainer.policy.megatron_config.expert_nvfp4_block_scale = block_scale
+    assert _nvfp4_env(prepare_runtime_environment(cfg)) == {"FLASHINFER_NVFP4_4OVER6": four_over_six, **_FI_ENV}
+
+
+def test_runtime_environment_has_no_nvfp4_env_without_expert_nvfp4(monkeypatch):
+    monkeypatch.setattr(train_utils, "peer_access_supported", lambda **_kwargs: True)
+    cfg = _make_validated_test_config()
+    cfg.trainer.strategy = "megatron"
+    assert _nvfp4_env(prepare_runtime_environment(cfg)) == {}
